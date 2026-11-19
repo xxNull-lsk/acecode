@@ -7,6 +7,7 @@
 #include "session/session_trajectory.hpp"
 #include "upgrade/manifest.hpp"
 #include "utils/encoding.hpp"
+#include "utils/machine_identity.hpp"
 #include "utils/utf8_path.hpp"
 
 #include <algorithm>
@@ -160,30 +161,6 @@ std::string trim_ascii_whitespace(std::string value) {
         value.pop_back();
     }
     return value;
-}
-
-std::string first_non_empty_env(std::initializer_list<const char*> names) {
-    for (const char* name : names) {
-        std::string value = trim_ascii_whitespace(getenv_utf8(name));
-        if (!value.empty()) return value;
-    }
-    return {};
-}
-
-std::string current_computer_name() {
-#ifdef _WIN32
-    return first_non_empty_env({"COMPUTERNAME", "HOSTNAME"});
-#else
-    return first_non_empty_env({"HOSTNAME", "COMPUTERNAME"});
-#endif
-}
-
-std::string current_login_name() {
-#ifdef _WIN32
-    return first_non_empty_env({"USERNAME", "USER", "LOGNAME"});
-#else
-    return first_non_empty_env({"USER", "LOGNAME", "USERNAME"});
-#endif
 }
 
 void append_filename_component(std::string& out, const std::string& value) {
@@ -399,10 +376,10 @@ FeedbackPackageResult build_feedback_package(const FeedbackPackageRequest& reque
         ? upgrade::current_target()
         : request.platform;
     const std::string computer_name = request.computer_name.empty()
-        ? current_computer_name()
+        ? utils::current_computer_name()
         : request.computer_name;
     const std::string login_name = request.login_name.empty()
-        ? current_login_name()
+        ? utils::current_login_name()
         : request.login_name;
     const std::string package_id = !request.session_id.empty()
         ? request.session_id

@@ -67,4 +67,13 @@ void SessionManager::adopt_swarm_identity_locked(const SessionMeta& meta) {
     channel_delegate_ = meta.channel_delegate;
 }
 
+// 团队标记只在磁盘上由 daemon 团队路由补写;管理器每次重建 meta 都从内存
+// 状态出发,这里把磁盘上已有的 team_id/team_role 读回继承,防止被抹掉。
+void SessionManager::inherit_team_meta_locked(SessionMeta& meta) const {
+    if (!meta.team_id.empty() || meta_path_str_.empty()) return;
+    const SessionMeta existing = SessionStorage::read_meta(meta_path_str_);
+    meta.team_id = existing.team_id;
+    meta.team_role = existing.team_role;
+}
+
 } // namespace acecode

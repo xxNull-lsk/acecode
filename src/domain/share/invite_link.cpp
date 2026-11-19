@@ -1,15 +1,8 @@
 #include "invite_link.hpp"
 #include "utils/base64.hpp"
-
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#endif
+#include "utils/host_validation.hpp"
 
 #include <algorithm>
-#include <array>
 #include <stdexcept>
 #include <nlohmann/json.hpp>
 
@@ -67,7 +60,7 @@ std::string validate(const InviteLink& invite) {
         !valid_share_credential(invite.credential) || invite.expires_at <= 0 ||
         invite.expires_at > 9007199254740991LL) return "invalid_fields";
     for (const auto& address : invite.addresses)
-        if (!valid_invite_address(address)) return "invalid_address";
+        if (!utils::is_valid_network_host(address)) return "invalid_address";
     return {};
 }
 } // namespace
@@ -81,33 +74,7 @@ bool valid_share_credential(std::string_view credential) {
 }
 
 bool valid_invite_address(std::string_view address) {
-    if (address.empty() || address.size() > 253) return false;
-    std::string value(address);
-    std::array<unsigned char, 16> parsed{};
-    if (value.find(':') != std::string::npos) {
-        const auto zone = value.find('%');
-        if (zone != std::string::npos) {
-            const auto suffix = value.substr(zone + 1);
-            if (suffix.empty() || !std::all_of(suffix.begin(), suffix.end(),
-                [](unsigned char c) { return ascii_alnum(c) || c == '_' || c == '-'; })) return false;
-            value.resize(zone);
-        }
-        return inet_pton(AF_INET6, value.c_str(), parsed.data()) == 1;
-    }
-    if (std::all_of(value.begin(), value.end(), [](unsigned char c) {
-            return (c >= '0' && c <= '9') || c == '.';
-        })) return inet_pton(AF_INET, value.c_str(), parsed.data()) == 1;
-    std::size_t start = 0;
-    while (start < value.size()) {
-        auto end = value.find('.', start);
-        if (end == std::string::npos) end = value.size();
-        if (end == start || end - start > 63 || !ascii_alnum(value[start]) ||
-            !ascii_alnum(value[end - 1])) return false;
-        for (auto i = start; i < end; ++i)
-            if (!ascii_alnum(value[i]) && value[i] != '-') return false;
-        start = end + 1;
-    }
-    return value.back() != '.';
+    return utils::is_valid_network_host(address);
 }
 
 std::string extract_invite_link(std::string_view text) {

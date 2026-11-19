@@ -199,3 +199,17 @@ TEST(CheckAuth, EitherTokenSourceMatchesIsEnough) {
     EXPECT_EQ(check_request_auth("8.8.8.8", "tk", "wrong", "tk"),
               AuthResult::Allowed);
 }
+
+// 场景(openspec: add-decentralized-team): 团队凭据 X-ACECode-Team-Token
+// 与 daemon token 完全隔离。只带团队凭据的远程请求必须被当作没带 token,
+// 否则队员可凭团队身份拿到整个 daemon 的完整控制权。
+TEST(CheckAuth, TeamCredentialDoesNotAuthorizeDaemon) {
+    // check_request_auth 只认 X-ACECode-Token / ?token=;团队头不进入这两个
+    // 参数,所以远程请求表现为 NoToken。
+    EXPECT_EQ(check_request_auth("192.168.1.50", "server-tk", "", ""),
+              AuthResult::NoToken);
+    // 即便攻击者把团队凭据塞进 query,也不等于 daemon token。
+    EXPECT_EQ(check_request_auth("192.168.1.50", "server-tk", "",
+                                 "team-credential-derived-from-seed"),
+              AuthResult::BadToken);
+}

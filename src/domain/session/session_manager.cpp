@@ -342,6 +342,7 @@ bool SessionManager::ensure_created() {
     meta.loop_run_id = loop_run_id_;
     meta.worktree = worktree_;
     write_swarm_identity_locked(meta);
+    inherit_team_meta_locked(meta);
     if (SessionStorage::write_meta(meta_path_str_, meta)) {
         local_user_title_write_pending_ = false;
     }
@@ -1211,6 +1212,7 @@ bool SessionManager::update_meta(
     meta.loop_run_id = loop_run_id_;
     meta.worktree = worktree_;
     write_swarm_identity_locked(meta);
+    inherit_team_meta_locked(meta);
     const bool written = SessionStorage::write_meta(meta_path_str_, meta);
     if (written) {
         local_user_title_write_pending_ = false;
@@ -1546,6 +1548,7 @@ void SessionManager::set_input_draft(std::string draft, nlohmann::json composer_
     }
     meta.input_draft = input_draft_;
     meta.input_draft_content = input_draft_content_;
+    inherit_team_meta_locked(meta);
     SessionStorage::write_meta(meta_path_str_, meta);
 }
 

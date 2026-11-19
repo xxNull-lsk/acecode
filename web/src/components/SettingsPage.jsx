@@ -70,6 +70,7 @@ import { SummaryGenerationSettings } from './SummaryGenerationSettings.jsx';
 import { ToolRewriteSettings } from './ToolRewriteSettings.jsx';
 import { SecurityCenterSettings } from './SecurityCenterSettings.jsx';
 import { ChannelsSettings } from './ChannelsSettings.jsx';
+import { TeamSettings } from './TeamSettings.jsx';
 import { ShortcutsSettings } from './ShortcutsSettings.jsx';
 import { SideChatRetentionSettings } from './SideChatRetentionSettings.jsx';
 import { MemorySettings } from './MemorySettings.jsx';
@@ -539,6 +540,7 @@ export function SettingsPage({
           {activeNavKey === 'mcp' && <SectionMCP />}
           {activeNavKey === 'connectors' && <SectionConnectors />}
           {activeNavKey === 'channels' && <ChannelsSettings />}
+          {activeNavKey === 'team' && <TeamSettings />}
           {activeNavKey === 'models' && (
             <SectionModel onModelProfileUpdated={onModelProfileUpdated} />
           )}

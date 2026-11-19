@@ -135,6 +135,7 @@ WebServer::Impl::~Impl() {
 void WebServer::Impl::register_routes() {
     register_sharing();
     register_peers();
+    register_team();
     register_share_socket();
     register_peer_socket();
     register_health();
@@ -197,6 +198,7 @@ WebServer::WebServer(WebServerDeps deps)
     install_crow_log_bridge();
     impl_->app.exception_handler(&route_exception_handler);
     impl_->initialize_sharing();
+    impl_->initialize_team();
     impl_->register_routes();
     impl_->initialize_model_reasoning_sync();
 }
@@ -253,6 +255,7 @@ void WebServer::stop() {
     impl_->home_intent_prompts.shutdown();
     if (impl_->shutdown_requested.exchange(true)) return;
     impl_->stop_sharing();
+    impl_->stop_team();
     if (impl_->model_reasoning_sync) impl_->model_reasoning_sync->stop();
     impl_->stop_side_chat_workers();
     std::lock_guard<std::mutex> stop_lock(impl_->listener_stop_mu);

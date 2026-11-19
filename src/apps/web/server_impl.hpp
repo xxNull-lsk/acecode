@@ -42,6 +42,12 @@
 #include "session/todo_state.hpp"
 #include "session/session_usage_ledger.hpp"
 #include "session/session_writer_lease.hpp"
+#include "team_host/team_service.hpp"
+#include "team_host/team_session_book.hpp"
+#include "team_host/team_client.hpp"
+#include "team_host/team_takeover.hpp"
+#include "team/repo_identity.hpp"
+#include "web/handlers/team_handler.hpp"
 #include "platform/process/os_process.hpp"
 #include "skills/skill_registry.hpp"
 #include "experts/expert_registry.hpp"
@@ -317,6 +323,45 @@ struct WebServer::Impl {
     // Stores are shared with owned guest/peer workers, never with remote code.
     std::shared_ptr<share::ShareStore> shares;
     std::shared_ptr<peers::PeerStore> peers;
+    // 团队运行时(add-decentralized-team):状态机 + 消息中继 + WS 连接表。
+    // team_service 为空(初始化失败/测试未启用)时团队路由返回 503。
+    std::shared_ptr<team::TeamService> team_service;
+    std::mutex team_mu;
+    std::unordered_map<std::string, std::shared_ptr<team::TeamMessageRelay>> team_relays;
+    struct TeamConnectionState {
+        std::string team_id;
+        std::string device_guid; // 连接方设备;空 = 本机 UI(带 daemon token)
+        std::vector<std::uint64_t> session_subs; // 事件转发订阅 id(按会话)
+    };
+    std::unordered_map<crow::websocket::connection*, std::shared_ptr<TeamConnectionState>> team_connections;
+    // onaccept → onopen 的过渡表(与 sharing 同款模式,按 state 原始指针索引)。
+    std::unordered_map<void*, std::shared_ptr<TeamConnectionState>> pending_team_connections;
+    // 本机 host 团队会话的事件订阅(session_id → subscription id),连接断开
+    // 后保留,daemon 退出时统一退订。
+    std::unordered_map<std::string, std::uint64_t> team_session_subs;
+    void initialize_team();
+    void stop_team();
+    void register_team();
+    void register_team_member_routes();
+    // 团队凭据校验(队员互访路由):header 与派生值一致才放行。
+    std::optional<crow::response> require_team_auth(const crow::request& req,
+                                                    const std::string& team_id);
+    // 把自己的 LAN 地址与在线状态写进成员记录(其他设备转发/取数依赖)。
+    void refresh_team_self_address(const std::string& team_id);
+    // 本机对团队的可达地址(LAN 地址 + 代理监听端口)。
+    std::string team_self_address();
+    // 队员消息投递:host 会话不在 registry(daemon 重启后)时先从磁盘恢复。
+    bool deliver_team_message(const std::string& session_id,
+                              const team::TeamInboundMessage& message);
+    // 取或建会话的队员消息中继。
+    std::shared_ptr<team::TeamMessageRelay> team_relay_for(const std::string& session_id);
+    // 向团队所有 WS 连接下发状态快照与会话事件(本机状态变更后调用)。
+    void broadcast_team_state(const std::string& team_id);
+    void broadcast_team_session_event(const std::string& team_id, std::string_view kind,
+                                      const team::TeamSessionRef& ref);
+    void forward_team_session_event(const std::string& team_id, const std::string& session_id,
+                                    const SessionEvent& event);
+    void ensure_team_session_subscriptions(const std::string& team_id);
     std::mutex sharing_mu;
     std::unordered_map<void*, std::shared_ptr<ShareConnection>> pending_sharing;
     std::unordered_map<crow::websocket::connection*, std::shared_ptr<ShareConnection>> sharing_connections;

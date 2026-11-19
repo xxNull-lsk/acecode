@@ -35,7 +35,7 @@ test('settings navigation uses the confirmed Codex-style groups', () => {
       {
         key: 'integrations',
         label: '集成',
-        items: ['技能', 'MCP 服务器', '插件', '消息通道'],
+        items: ['技能', 'MCP 服务器', '插件', '消息通道', '团队'],
       },
       {
         key: 'coding',
@@ -70,6 +70,7 @@ test('flattened settings routes remain unique and complete', () => {
     'mcp',
     'connectors',
     'channels',
+    'team',
     'models',
     'tools',
     'hooks',

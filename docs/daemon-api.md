@@ -6847,3 +6847,45 @@ Runtime-generated names use underscore separators. Existing hyphen-named data re
 `WS /ws/peers/:id` 使用本机 daemon 的常规鉴权，转发以上访客协议，不接受主会话输入、审批或中止消息。网页不加载对端页面或脚本，完整分享凭据保留在 daemon 存储。已保存对端跨工作区共用；同一身份、同一会话的新邀请更新已有记录。
 
 跨机器图片经过本机接口，远程 `visual` 代码块只显示源码。私有/链路本地/唯一本地地址及单段主机名优先直连，不受系统或手动代理影响。
+
+## 去中心化团队
+
+完整说明见 [团队协作](team/team-feature-plan.md)。团队凭据 `X-ACECode-Team-Token`（由 invite_seed 派生）只用于队员互访路由，不能当作 daemon token，也不能通过 daemon 鉴权；daemon token 也不能访问 `/api/team/v1/*`。团队元数据在成员间逐字段 last-writer-wins 收敛，存储在 `~/.acecode/team/<team_id>/`，不写项目目录。
+
+### 本机管理接口（daemon token）
+
+| 方法与路径 | 请求 / 返回 |
+| --- | --- |
+| `POST /api/team` | `{name?}`；创建团队，创建者即管理员，返回公开元数据（不含 invite_seed） |
+| `GET /api/team` | `{teams: [...]}`；含成员（在线状态、每日额度、最后已知已用）、会话引用与本机承接能力 `self` |
+| `GET /api/team/:team_id` | 单个团队状态，结构同上 |
+| `POST /api/team/:team_id/invite` | `{addresses?, port?}`；签发一次性邀请码，返回 `{link, expires_at}`；链接 15 分钟内有效且只能消费一次 |
+| `POST /api/team/join` | `{link}`；解码邀请码、从邀请者拉全量快照并落盘 |
+| `POST /api/team/:team_id/role` | `{guid, role: "admin"/"member"}`；仅管理员 |
+| `POST /api/team/:team_id/quota` | `{daily_token_quota}`；成员修改自己的每日额度（0 = 当日不承接），即时保存 |
+| `POST /api/team/:team_id/sync` | `{address, port}`；从指定在线队员拉取合并并回推本机合并结果 |
+| `POST /api/team/:team_id/session` | `{cwd, title?}`；发起团队会话：仓库身份必须已关联团队、并发 ≤ 5，本机成为 host，`SessionMeta` 打 `team_id/team_role` 标记 |
+| `POST /api/team/:team_id/session/:sid/state` | `{state: "running"/"paused"/"ended", pause_reason?}` |
+| `POST /api/team/:team_id/session/:sid/takeover` | `{cwd}`；手动接管：资格校验（在线源或最近副本 + 本机额度）→ 取数 → `git fetch` + `--ff-only pull` 对齐源 HEAD（不自动 commit/push，失败即中止保持暂停）→ 切 host → resume |
+
+### 队员互访接口（X-ACECode-Team-Token）
+
+| 方法与路径 | 行为 |
+| --- | --- |
+| `POST /api/team/v1/join` | `{token, guid, account?, display_name?}`；邀请者验证并消费一次性邀请码，返回 `{snapshot}` 全量团队状态 |
+| `GET /api/team/v1/state?team_id=` | 返回 `{snapshot}` |
+| `POST /api/team/v1/state/push?team_id=` | `{snapshot}`；对端按 LWW 合并 |
+| `POST /api/team/v1/session/message?team_id=` | `{session_id, text, sender_guid?, sender_name?}`；host 是唯一写者：host 空闲则追加 human 消息（标注发送者）并触发 AI 回合，忙时进入等待队列返回 202，回合结束按 FIFO 投递 |
+| `GET /api/team/v1/session/data?team_id=&session_id=` | 接管取数：`{jsonl, meta, head_commit}`；仅会话 host 返回 |
+
+### 团队 WebSocket
+
+`WS /ws/team/:team_id` 两种凭据二选一：query `token`（daemon token，本机 UI 管理视图）或 `X-ACECode-Team-Token` 请求头（队员只读投影，不产生任何写入）。连接建立即下发 `{type: "team_state", state}` 快照；此后：
+
+- `{type: "team_state", state}` — 团队元数据每次变更后重新下发；
+- `{type: "team_session_event", event}` — 会话 created / paused / ended / host_changed（暂停带原因，切换带新 host）；
+- `{type: "session_event", session_id, seq, event_kind, data}` — host 本机会话事件流投影（含 busy_changed、message、usage 等），多连接按 seq 一致有序，查看者不产生写入。
+
+### 额度
+
+每日贡献额度默认 30M LLM tokens，UTC 日分桶记账，记在 host 设备自己头上；普通会话消耗不入账。当日已用达到额度后该设备停止承接：本机 host 的会话置 `paused(额度已用尽)`，其他队员的发起/切入被拒并提示额度已用尽。次日用量归零、配额暂停自动恢复 running（失联/异常原因的暂停不受影响）。

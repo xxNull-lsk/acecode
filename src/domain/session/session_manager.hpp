@@ -390,6 +390,10 @@ private:
     std::string agent_path_;
     ChannelDelegate channel_delegate_;
     void write_swarm_identity_locked(SessionMeta& meta) const;
+    // 团队标记(team_id/team_role)由 daemon 团队路由在会话创建后补写进 meta
+    // 文件;管理器重建 meta 时不携带这两个字段,不保留会被下一次写盘抹掉。
+    // 这里从磁盘读回继承(仅当新 meta 为空时);文件不存在则保持为空。
+    void inherit_team_meta_locked(SessionMeta& meta) const;
     void adopt_swarm_identity_locked(const SessionMeta& meta);
     void ensure_file_checkpoints_loaded_locked() const;
     mutable bool file_checkpoints_loaded_ = true;

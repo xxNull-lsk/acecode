@@ -58,7 +58,9 @@ void WebServer::Impl::reconcile_share_listener() {
         if (cfg) { enabled = cfg->remote_enabled; configured_port = cfg->remote_port; }
     }
     const auto current = deps.remote_web_proxy->status();
-    if (!deps.dangerous && (enabled || shares->has_active(now_unix_ms() / 1000))) {
+    bool has_teams = false;
+    if (team_service) has_teams = !team_service->load_teams().empty();
+    if (!deps.dangerous && (enabled || has_teams || shares->has_active(now_unix_ms() / 1000))) {
         if (!current.running || (configured_port != 0 && current.port != configured_port))
             deps.remote_web_proxy->start(configured_port, runtime_port);
     } else if (current.running || current.starting) deps.remote_web_proxy->stop();

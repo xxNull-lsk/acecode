@@ -128,6 +128,11 @@ struct SessionMeta {
     std::string last_user_message_at; // ISO 8601; human input, not background activity.
     std::string last_turn_outcome; // completed | aborted | error; empty = unknown/pending.
     std::int64_t model_activated_at_ms = 0; // Successful selection/use, independent of UI edits.
+
+    // 团队会话标记(openspec: add-decentralized-team)。空 = 普通会话。
+    // team_role 描述本机角色:host(权威副本)/ member(查看或投递)。序列化省略空值。
+    std::string team_id;
+    std::string team_role; // "host" | "member"
 };
 
 class SessionStorage {

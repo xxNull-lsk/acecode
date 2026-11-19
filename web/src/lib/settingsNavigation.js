@@ -20,6 +20,7 @@ export const SETTINGS_NAV_GROUPS = [
       { key: 'mcp', label: 'MCP 服务器', icon: 'mcp' },
       { key: 'connectors', label: '插件', icon: 'extension' },
       { key: 'channels', label: '消息通道', icon: 'chat' },
+      { key: 'team', label: '团队', icon: 'antenna' },
     ],
   },
   {

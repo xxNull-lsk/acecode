@@ -374,16 +374,14 @@ bool SessionStorage::write_meta(const std::string& meta_path, const SessionMeta&
         };
         if (meta.worktree.inherited) j["worktree_session"]["inherited"] = true;
     }
-    if (meta.archived) {
-        j["archived"] = true;
-    }
-    if (meta.no_workspace) {
-        j["no_workspace"] = true;
-    }
+    if (meta.archived) j["archived"] = true;
+    if (meta.no_workspace) j["no_workspace"] = true;
     if (!meta.memory_mode.empty()) j["memory_mode"] = meta.memory_mode;
     if (!meta.surface.empty()) j["surface"] = meta.surface;
     if (!meta.swarm_mode.empty() && meta.swarm_mode != "off") j["swarm_mode"] = meta.swarm_mode;
     if (!meta.agent_path.empty()) j["mesh_agent"] = {{"path", meta.agent_path}};
+    if (!meta.team_id.empty()) j["team_id"] = meta.team_id;
+    if (!meta.team_role.empty()) j["team_role"] = meta.team_role;
     if (meta.channel_delegate.active()) j["channel_delegate"] = channel_delegate_to_json(meta.channel_delegate);
 
     std::error_code ec;
@@ -458,9 +456,8 @@ SessionMeta SessionStorage::read_meta(const std::string& meta_path, bool* explic
         meta.expert_id = j.value("expert_id", std::string{});
         meta.expert_member_id = j.value("expert_member_id", std::string{});
         if (j.contains("loop_execution") && j["loop_execution"].is_object()) {
-            const auto& loop = j["loop_execution"];
-            meta.loop_id = loop.value("loop_id", std::string{});
-            meta.loop_run_id = loop.value("run_id", std::string{});
+            meta.loop_id = j["loop_execution"].value("loop_id", std::string{});
+            meta.loop_run_id = j["loop_execution"].value("run_id", std::string{});
         }
         if (j.contains("worktree_session") && j["worktree_session"].is_object()) {
             const auto& wt = j["worktree_session"];
@@ -468,8 +465,7 @@ SessionMeta SessionStorage::read_meta(const std::string& meta_path, bool* explic
             meta.worktree.worktree_path = wt.value("worktree_path", std::string{});
             meta.worktree.worktree_name = wt.value("worktree_name", std::string{});
             meta.worktree.worktree_branch = wt.value("worktree_branch", std::string{});
-            meta.worktree.original_head_commit =
-                wt.value("original_head_commit", std::string{});
+            meta.worktree.original_head_commit = wt.value("original_head_commit", std::string{});
             meta.worktree.inherited = wt.value("inherited", false);
         }
         meta.archived        = j.value("archived",        false);
@@ -480,6 +476,8 @@ SessionMeta SessionStorage::read_meta(const std::string& meta_path, bool* explic
         if (j.contains("mesh_agent") && j["mesh_agent"].is_object()) {
             meta.agent_path = j["mesh_agent"].value("path", std::string{});
         }
+        meta.team_id         = j.value("team_id",        std::string{});
+        meta.team_role       = j.value("team_role",      std::string{});
         if (j.contains("channel_delegate")) meta.channel_delegate = channel_delegate_from_json(j["channel_delegate"]);
         if (explicitly_empty) {
             const auto count = j.find("message_count");

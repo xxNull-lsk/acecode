@@ -376,6 +376,39 @@ export function createApi(base = null) {
       if (token) url.searchParams.set('token', token);
       return new WebSocket(url.href);
     },
+    // ── 去中心化团队(add-decentralized-team) ──
+    createTeam: (name) => request('POST', '/api/team', { name }, base),
+    listTeams: () => request('GET', '/api/team', undefined, base),
+    teamState: (teamId) => request('GET', `/api/team/${encodeURIComponent(teamId)}`, undefined, base),
+    issueTeamInvite: (teamId, options = {}) =>
+      request('POST', `/api/team/${encodeURIComponent(teamId)}/invite`, options, base),
+    joinTeam: (link) => request('POST', '/api/team/join', { link }, base, { timeoutMs: 100000 }),
+    setTeamRole: (teamId, guid, role) =>
+      request('POST', `/api/team/${encodeURIComponent(teamId)}/role`, { guid, role }, base),
+    setTeamQuota: (teamId, dailyTokenQuota) =>
+      request('POST', `/api/team/${encodeURIComponent(teamId)}/quota`, { daily_token_quota: dailyTokenQuota }, base),
+    syncTeam: (teamId, address, port) =>
+      request('POST', `/api/team/${encodeURIComponent(teamId)}/sync`, { address, port }, base, { timeoutMs: 30000 }),
+    linkTeamRepo: (teamId, cwd) =>
+      request('POST', `/api/team/${encodeURIComponent(teamId)}/repos`, cwd ? { cwd } : {}, base, { timeoutMs: 30000 }),
+    startTeamSession: (teamId, options) =>
+      request('POST', `/api/team/${encodeURIComponent(teamId)}/session`, options, base, { timeoutMs: 100000 }),
+    setTeamSessionState: (teamId, sessionId, state, pauseReason) =>
+      request('POST', `/api/team/${encodeURIComponent(teamId)}/session/${encodeURIComponent(sessionId)}/state`,
+        pauseReason == null ? { state } : { state, pause_reason: pauseReason }, base),
+    takeoverTeamSession: (teamId, sessionId, cwd) =>
+      request('POST', `/api/team/${encodeURIComponent(teamId)}/session/${encodeURIComponent(sessionId)}/takeover`,
+        { cwd }, base, { timeoutMs: 120000 }),
+    sendTeamSessionMessage: (teamId, sessionId, text) =>
+      request('POST', `/api/team/${encodeURIComponent(teamId)}/session/${encodeURIComponent(sessionId)}/message`,
+        { text }, base, { timeoutMs: 30000 }),
+    teamSocket: (teamId) => {
+      const url = new URL(fullUrl(`/ws/team/${encodeURIComponent(teamId)}`, base), window.location.href);
+      url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+      const token = baseToken(base);
+      if (token) url.searchParams.set('token', token);
+      return new WebSocket(url.href);
+    },
     health:           ()             => request('GET',    '/api/health', undefined, base),
     reportSessionOpen: (measurement) => request('POST', '/api/diagnostics/session-open', measurement, base, { timeoutMs: 2000 }),
     // 实时状态卡住 / WS 心跳超时 / 事件游标重置的现场,daemon 记一行 WARN 日志。
