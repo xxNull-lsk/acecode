@@ -146,6 +146,44 @@ TEST(TeamStore, InvalidInviteRecordFailsWholeLedger) {
     EXPECT_FALSE(store.consume_invite("tok-1", "guid", 1));
 }
 
+// 场景: 本机团队状态 local.json 往返;损坏/缺失按"未设置"处理
+TEST(TeamStore, LocalStateRoundTrip) {
+    TempDir temp;
+    TeamStore store(temp.utf8(), "team-1");
+
+    const TeamLocalState missing = store.load_local_state();
+    EXPECT_TRUE(missing.work_dir.empty()); // 缺文件 = 未设置
+
+    TeamLocalState state;
+    state.work_dir = "/home/a/projects/demo";
+    ASSERT_TRUE(store.save_local_state(state));
+
+    const fs::path expected = temp.root / "team" / "team-1" / "local.json";
+    EXPECT_TRUE(fs::exists(expected));
+    const TeamLocalState loaded = store.load_local_state();
+    EXPECT_EQ(loaded.work_dir, "/home/a/projects/demo");
+
+    // 覆盖写生效
+    TeamLocalState next;
+    next.work_dir = "/home/b/other";
+    ASSERT_TRUE(store.save_local_state(next));
+    EXPECT_EQ(store.load_local_state().work_dir, "/home/b/other");
+
+    // 空 work_dir 序列化为不带字段的对象,读回仍是空
+    ASSERT_TRUE(store.save_local_state(TeamLocalState{}));
+    EXPECT_TRUE(store.load_local_state().work_dir.empty());
+}
+
+// 场景: local.json 损坏 → 按"未设置"处理,不抛异常
+TEST(TeamStore, CorruptLocalStateReadsAsUnset) {
+    TempDir temp;
+    TeamStore store(temp.utf8(), "team-1");
+    fs::create_directories(temp.root / "team" / "team-1");
+    atomic_write_file(path_to_utf8(temp.root / "team" / "team-1" / "local.json"),
+                      "{broken");
+    EXPECT_TRUE(store.load_local_state().work_dir.empty());
+}
+
 // 场景: 会话副本目录按会话 ID 创建,team_id 之间互不可见
 TEST(TeamStore, ReplicaDirIsolatedPerTeam) {
     TempDir temp;

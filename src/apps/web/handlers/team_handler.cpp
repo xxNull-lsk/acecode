@@ -80,4 +80,50 @@ std::string validate_team_session_start_body(const nlohmann::json& body) {
     return {};
 }
 
+std::string validate_team_create_body(const nlohmann::json& body) {
+    if (!body.is_object()) return "invalid_body";
+    const auto name = body.find("name");
+    if (name == body.end() || !name->is_string() || name->get<std::string>().empty())
+        return "invalid_name";
+    const auto cwd = body.find("cwd");
+    if (cwd == body.end() || !cwd->is_string() || cwd->get<std::string>().empty())
+        return "invalid_cwd";
+    // repo_url 可省略(工作目录是 git 仓库时从目录解析);给了就必须是字符串。
+    const auto repo_url = body.find("repo_url");
+    if (repo_url != body.end() && !repo_url->is_string()) return "invalid_repo_url";
+    return {};
+}
+
+std::string validate_team_join_body(const nlohmann::json& body) {
+    if (!body.is_object()) return "invalid_body";
+    const auto link = body.find("link");
+    if (link == body.end() || !link->is_string() || link->get<std::string>().empty())
+        return "invalid_link";
+    const auto cwd = body.find("cwd");
+    if (cwd == body.end() || !cwd->is_string() || cwd->get<std::string>().empty())
+        return "invalid_cwd";
+    return {};
+}
+
+std::string resolve_team_session_cwd(const nlohmann::json& body,
+                                     const std::string& local_work_dir,
+                                     const std::string& fallback) {
+    if (body.is_object()) {
+        const auto cwd = body.find("cwd");
+        if (cwd != body.end() && cwd->is_string() && !cwd->get<std::string>().empty())
+            return cwd->get<std::string>();
+    }
+    if (!local_work_dir.empty()) return local_work_dir;
+    return fallback;
+}
+
+nlohmann::json team_session_local_info_json(const std::string& cwd,
+                                            const std::string& workspace_hash) {
+    nlohmann::json j = nlohmann::json::object();
+    if (cwd.empty()) return j;
+    j["cwd"] = cwd;
+    if (!workspace_hash.empty()) j["workspace_hash"] = workspace_hash;
+    return j;
+}
+
 } // namespace acecode::web

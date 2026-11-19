@@ -68,6 +68,11 @@ std::string validate(const TeamInviteLink& invite, std::int64_t now) {
     if (invite.expires_at > now + kInviteTtlSeconds) return "invalid_expiry";
     for (const auto& address : invite.addresses)
         if (!utils::is_valid_network_host(address)) return "invalid_address";
+    // 仓库身份只收 remote 类;条目上限与长度上限保护 1024 载荷预算。
+    if (invite.repos.size() > 4) return "invalid_fields";
+    for (const auto& repo : invite.repos)
+        if (repo.kind != "remote" || repo.value.empty() || repo.value.size() > 256)
+            return "invalid_fields";
     return {};
 }
 
@@ -117,6 +122,21 @@ TeamInviteDecodeResult decode_team_invite_link(std::string_view text, std::int64
             json["in"].get<std::string>(), json["ig"].get<std::string>(),
             json["a"].get<std::vector<std::string>>(), json["p"].get<int>(),
             json["c"].get<std::string>(), json["e"].get<std::int64_t>()};
+        // 可选 r 字段:团队仓库身份(remote 类),供加入方在网络连接前预检
+        // 工作目录。旧邀请码没有该字段,解码为空(跳过匹配),向后兼容。
+        const auto repos = json.find("r");
+        if (repos != json.end()) {
+            if (!repos->is_array()) { result.error = "invalid_fields"; return result; }
+            for (const auto& entry : *repos) {
+                if (!entry.is_object() || !entry.contains("k") || !entry["k"].is_string() ||
+                    !entry.contains("v") || !entry["v"].is_string()) {
+                    result.error = "invalid_fields";
+                    return result;
+                }
+                result.value.repos.push_back({entry["k"].get<std::string>(),
+                                              entry["v"].get<std::string>()});
+            }
+        }
         result.error = validate(result.value, now);
         // 与 invite_usable 同口径:expires_at 时刻仍有效,超过才判过期。
         if (result.error.empty() && result.value.expires_at < now) result.error = "expired";
@@ -133,6 +153,13 @@ std::string encode_team_invite_link(const TeamInviteLink& invite, std::int64_t n
         {"in", invite.inviter_name}, {"ig", invite.inviter_guid},
         {"a", invite.addresses}, {"p", invite.port}, {"c", invite.token},
         {"e", invite.expires_at}};
+    // 仓库身份只在有内容时写出(旧版本 daemon 与短链接都受益于省略)。
+    if (!invite.repos.empty()) {
+        auto repos = nlohmann::json::array();
+        for (const auto& repo : invite.repos)
+            repos.push_back({{"k", repo.kind}, {"v", repo.value}});
+        json["r"] = std::move(repos);
+    }
     auto bytes = json.dump();
     const auto crc = checksum(bytes);
     for (int shift = 24; shift >= 0; shift -= 8)

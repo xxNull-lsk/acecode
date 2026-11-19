@@ -14,6 +14,7 @@ import {
   sidebarExtensionLayout,
   moveSidebarExtension,
   normalizeSidebarExtensionPrefs,
+  normalizeSidebarSectionExpansion,
   toggleSidebarExtensionPinned,
   validateSidebarExtensionPrefs,
   validateSidebarSectionExpansion,
@@ -115,15 +116,35 @@ test('sidebar sections use confirmed labels and default expanded state', () => {
     pinned: '置顶',
     tasks: '任务',
     workspaces: '工作区',
+    teams: '团队',
   });
   assert.deepEqual(DEFAULT_SIDEBAR_SECTION_EXPANSION, {
     pinned: true,
     tasks: true,
     workspaces: true,
+    teams: true,
   });
   assert.equal(validateSidebarSectionExpansion(DEFAULT_SIDEBAR_SECTION_EXPANSION), true);
-  assert.equal(validateSidebarSectionExpansion({ pinned: true, tasks: true }), false);
+  // 已知键为布尔即可,允许缺键(旧持久化数据没有 teams)
+  assert.equal(validateSidebarSectionExpansion({ pinned: true, tasks: true, workspaces: true }), true);
   assert.equal(validateSidebarSectionExpansion({ pinned: true, tasks: true, workspaces: 'yes' }), false);
+  // 缺键合法(旧持久化数据没有 teams;缺多少都由 normalize 补默认)
+  assert.equal(validateSidebarSectionExpansion({ pinned: true, tasks: true }), true);
+  assert.equal(validateSidebarSectionExpansion({ pinned: true, tasks: true, teams: false }), true);
+  assert.equal(validateSidebarSectionExpansion({ pinned: true, unknown: true }), false);
+});
+
+test('normalize section expansion fills missing keys with defaults', () => {
+  assert.deepEqual(
+    normalizeSidebarSectionExpansion({ pinned: true, tasks: false, workspaces: true }),
+    { pinned: true, tasks: false, workspaces: true, teams: true },
+  );
+  assert.deepEqual(normalizeSidebarSectionExpansion({ pinned: false }), {
+    pinned: false, tasks: true, workspaces: true, teams: true,
+  });
+  // 损坏数据整体落默认
+  assert.deepEqual(normalizeSidebarSectionExpansion('bad'), DEFAULT_SIDEBAR_SECTION_EXPANSION);
+  assert.deepEqual(normalizeSidebarSectionExpansion(null), DEFAULT_SIDEBAR_SECTION_EXPANSION);
 });
 
 test('sidebar section counts separate pinned tasks, no-workspace tasks, and workspaces', () => {
@@ -132,11 +153,11 @@ test('sidebar section counts separate pinned tasks, no-workspace tasks, and work
     noWorkspaceSessions: [{ id: 'n1' }],
     workspaces: [{ hash: 'w1' }, { hash: 'w2' }, { hash: 'w3' }],
   });
-  assert.deepEqual(counts, { pinned: 2, tasks: 1, workspaces: 3 });
+  assert.deepEqual(counts, { pinned: 2, tasks: 1, workspaces: 3, teams: 0 });
   assert.equal(sidebarSectionTitle(SIDEBAR_SECTION_IDS.PINNED, counts.pinned), '置顶 (2)');
   assert.equal(sidebarSectionTitle(SIDEBAR_SECTION_IDS.TASKS, counts.tasks), '任务 (1)');
   assert.equal(sidebarSectionTitle(SIDEBAR_SECTION_IDS.WORKSPACES, counts.workspaces), '工作区 (3)');
-  assert.deepEqual(sidebarSectionCounts(), { pinned: 0, tasks: 0, workspaces: 0 });
+  assert.deepEqual(sidebarSectionCounts(), { pinned: 0, tasks: 0, workspaces: 0, teams: 0 });
 });
 
 test('sidebar sections render only when their count is positive', () => {

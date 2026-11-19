@@ -33,6 +33,10 @@ struct RepoIdentityResult {
 // 生成的标识文件是原子写,内容为一行 uuid。
 RepoIdentityResult resolve_repo_identity(const std::string& cwd);
 
+// 显式提供的远程仓库 URL -> {remote, 规范化 URL}。本地路径 / file:// /
+// 缺 host/path 等无法跨设备复用的写法返回错误 invalid_repo_url。
+RepoIdentityResult repo_identity_from_url(const std::string& url);
+
 // 团队是否关联了该仓库身份。
 bool team_matches_repo(const TeamMeta& meta, const RepoIdentity& identity);
 

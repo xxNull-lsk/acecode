@@ -376,13 +376,18 @@ export function createApi(base = null) {
       if (token) url.searchParams.set('token', token);
       return new WebSocket(url.href);
     },
-    // ── 去中心化团队(add-decentralized-team) ──
-    createTeam: (name) => request('POST', '/api/team', { name }, base),
+    // ── 去中心化团队(add-decentralized-team + add-team-workdir-sidebar) ──
+    createTeam: (name, options = {}) => request('POST', '/api/team', {
+      name,
+      cwd: options.cwd,
+      ...(options.repoUrl ? { repo_url: options.repoUrl } : {}),
+    }, base),
     listTeams: () => request('GET', '/api/team', undefined, base),
     teamState: (teamId) => request('GET', `/api/team/${encodeURIComponent(teamId)}`, undefined, base),
     issueTeamInvite: (teamId, options = {}) =>
       request('POST', `/api/team/${encodeURIComponent(teamId)}/invite`, options, base),
-    joinTeam: (link) => request('POST', '/api/team/join', { link }, base, { timeoutMs: 100000 }),
+    joinTeam: (link, cwd) =>
+      request('POST', '/api/team/join', { link, cwd }, base, { timeoutMs: 100000 }),
     setTeamRole: (teamId, guid, role) =>
       request('POST', `/api/team/${encodeURIComponent(teamId)}/role`, { guid, role }, base),
     setTeamQuota: (teamId, dailyTokenQuota) =>

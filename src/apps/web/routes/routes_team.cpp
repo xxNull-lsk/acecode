@@ -8,15 +8,20 @@
 #include "team_host/team_client.hpp"
 #include "team_host/team_takeover.hpp"
 #include "utils/machine_identity.hpp"
+#include "utils/paths.hpp"
 #include "utils/text.hpp"
 #include "utils/url_encoding.hpp"
 #include "worktree/worktree_manager.hpp"
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <sstream>
+
+namespace fs = std::filesystem;
 
 namespace acecode::web {
 using nlohmann::json;
@@ -48,6 +53,58 @@ std::string read_file_or_empty(const std::string& path) {
     std::ostringstream buffer;
     buffer << input.rdbuf();
     return buffer.str();
+}
+
+// 本机定位查找:在本机 projects/ 各工作区目录下找该会话的 meta。
+// 找到返回 cwd 与(非 no_workspace 会话的)workspace_hash;找不到说明
+// 该团队会话由其他设备托管,保持稀疏投影。
+struct LocalSessionLocation {
+    std::string cwd;
+    std::string workspace_hash;
+};
+std::optional<LocalSessionLocation> find_local_session_location(
+    const std::string& session_id) {
+    if (session_id.empty()) return std::nullopt;
+    std::error_code ec;
+    const fs::path projects = fs::path(get_acecode_dir()) / "projects";
+    if (!fs::exists(projects, ec)) return std::nullopt;
+    for (const auto& entry : fs::directory_iterator(projects, ec)) {
+        if (!entry.is_directory(ec)) continue;
+        const fs::path meta_path = entry.path() / (session_id + ".meta.json");
+        if (!fs::exists(meta_path, ec)) continue;
+        const auto meta = SessionStorage::read_meta(path_to_utf8(meta_path));
+        LocalSessionLocation location;
+        location.cwd = meta.cwd;
+        if (!meta.no_workspace && !meta.cwd.empty())
+            location.workspace_hash = SessionStorage::compute_project_hash(meta.cwd);
+        return location;
+    }
+    return std::nullopt;
+}
+
+// 团队会话引用公开视图 + 本机定位投影(本机存在会话数据时补 cwd/hash)。
+nlohmann::json team_session_ref_with_local_info(const team::TeamSessionRef& ref) {
+    auto j = web::team_session_ref_public_json(ref);
+    if (const auto location = find_local_session_location(ref.session_id)) {
+        const auto local = web::team_session_local_info_json(location->cwd,
+                                                            location->workspace_hash);
+        for (auto it = local.begin(); it != local.end(); ++it) j[it.key()] = it.value();
+    }
+    return j;
+}
+
+// 团队状态 JSON 的会话列表逐条合并本机定位(仅本机 UI 可见,见下)。
+void merge_local_session_info_into_state(json& state) {
+    auto sessions = state.find("sessions");
+    if (sessions == state.end() || !sessions->is_array()) return;
+    for (auto& ref : *sessions) {
+        const std::string session_id = ref.value("session_id", std::string{});
+        const auto location = find_local_session_location(session_id);
+        if (!location) continue;
+        const auto local = web::team_session_local_info_json(location->cwd,
+                                                            location->workspace_hash);
+        for (auto it = local.begin(); it != local.end(); ++it) ref[it.key()] = it.value();
+    }
 }
 
 // 本机对团队的可达地址(LAN 地址 + 代理监听端口):见 Impl::team_self_address()。
@@ -173,17 +230,30 @@ void WebServer::Impl::broadcast_team_state(const std::string& team_id) {    if (
     const auto meta = team_service->load_team(team_id);
     if (!meta) return;
     const team::QuotaLedger ledger(team_service->data_dir(), team_id);
-    const auto state = web::team_state_json(*meta, team_service->self().guid, ledger,
-                                            team_service->now());
-    const std::string text =
+    auto state = web::team_state_json(*meta, team_service->self().guid, ledger,
+                                      team_service->now());
+    // 本机定位投影只发给本机 UI(daemon token 连接):各设备本地路径不同,
+    // 本机路径对其他设备没有意义,也不该随状态广播出去。
+    json plain_state = state;
+    merge_local_session_info_into_state(state);
+    const std::string local_text =
         json{{"type", "team_state"}, {"team_id", team_id}, {"state", state}}.dump();
+    const std::string plain_text =
+        json{{"type", "team_state"}, {"team_id", team_id}, {"state", plain_state}}.dump();
     std::vector<crow::websocket::connection*> targets;
     {
         std::lock_guard<std::mutex> lock(team_mu);
         for (auto& [connection, connection_state] : team_connections)
             if (connection_state->team_id == team_id) targets.push_back(connection);
     }
-    for (auto* connection : targets) connection->send_text(text);
+    for (auto* connection : targets) {
+        const auto it = team_connections.find(connection);
+        // onaccept 把本机 UI 记为自身 GUID,队员连接记为 "remote-member"。
+        const bool local_ui = it != team_connections.end() &&
+            (it->second->device_guid.empty() ||
+             it->second->device_guid == team_service->self().guid);
+        connection->send_text(local_ui ? local_text : plain_text);
+    }
 }
 
 void WebServer::Impl::broadcast_team_session_event(const std::string& team_id,
@@ -312,19 +382,42 @@ void WebServer::Impl::ensure_team_session_subscriptions(const std::string& team_
 // =====================================================================
 
 void WebServer::Impl::register_team() {
-    // 创建团队(创建者即管理员)。
+    // 创建团队(创建者即管理员):名称 + 工作目录 + 可选仓库 URL。
+    // 工作目录是 git 仓库时从目录解析仓库身份;否则必须给 URL。
+    // 身份解析在创建之前:失败则团队不创建,前端按错误码提示补救。
     CROW_ROUTE(app, "/api/team").methods(crow::HTTPMethod::POST)
     ([this](const crow::request& req) {
         if (auto denied = require_auth(req)) return std::move(*denied);
         if (!team_service) return team_error(req, 503, "team_unavailable");
         const auto body = json::parse(req.body, nullptr, false);
-        const std::string name = body.is_object() && body.contains("name") &&
-            body["name"].is_string() ? body["name"].get<std::string>() : std::string{};
+        if (const std::string invalid = web::validate_team_create_body(body); !invalid.empty())
+            return team_error(req, 400, invalid);
+        const std::string name = body["name"].get<std::string>();
+        const std::string cwd = body["cwd"].get<std::string>();
+        const std::string repo_url = body.contains("repo_url") && body["repo_url"].is_string()
+            ? body["repo_url"].get<std::string>() : std::string{};
+        const auto repo = repo_url.empty()
+            ? team::resolve_repo_identity(cwd)
+            : team::repo_identity_from_url(repo_url);
+        if (!repo) {
+            const std::string code = repo.error == "not_git_repo"
+                ? "workdir_not_git_repo" : repo.error;
+            return team_error(req, 400, code);
+        }
+
         std::string error;
-        const auto meta = team_service->create_team(name, &error);
-        if (!meta) return team_error(req, 500, error.empty() ? "create_failed" : error);
-        broadcast_team_state(meta->team_id);
-        return team_response(req, 200, web::team_meta_public_json(*meta).dump());
+        const auto created = team_service->create_team(name, &error);
+        if (!created) return team_error(req, 500, error.empty() ? "create_failed" : error);
+        const auto registered = team_service->register_repo(created->team_id, repo.identity);
+        if (!registered) return team_error(req, 500, registered.error);
+        // 记住本机团队工作目录(每设备本地状态,不随元数据同步)。
+        team::TeamLocalState local;
+        local.work_dir = cwd;
+        team_service->store_for(created->team_id).save_local_state(local);
+        broadcast_team_state(created->team_id);
+        const auto meta = team_service->load_team(created->team_id);
+        return team_response(req, 200, web::team_meta_public_json(
+            meta ? *meta : *created).dump());
     });
 
     // 团队列表。
@@ -337,8 +430,12 @@ void WebServer::Impl::register_team() {
         auto result = json::array();
         for (const auto& meta : team_service->load_teams()) {
             team::QuotaLedger ledger(team_service->data_dir(), meta.team_id);
-            result.push_back(web::team_state_json(meta, team_service->self().guid, ledger,
-                                                  team_service->now()));
+            auto state = web::team_state_json(meta, team_service->self().guid, ledger,
+                                              team_service->now());
+            // 本机 UI 的 REST 响应:本机存在的会话补 cwd/workspace_hash,
+            // 供侧边栏把团队会话当普通会话打开。
+            merge_local_session_info_into_state(state);
+            result.push_back(std::move(state));
         }
         return team_response(req, 200, json{{"teams", result}}.dump());
     });
@@ -352,9 +449,10 @@ void WebServer::Impl::register_team() {
         const auto meta = team_service->load_team(team_id);
         if (!meta) return team_error(req, 404, "team_not_found");
         team::QuotaLedger ledger(team_service->data_dir(), team_id);
-        return team_response(req, 200,
-            web::team_state_json(*meta, team_service->self().guid, ledger,
-                                 team_service->now()).dump());
+        auto state = web::team_state_json(*meta, team_service->self().guid, ledger,
+                                          team_service->now());
+        merge_local_session_info_into_state(state);
+        return team_response(req, 200, state.dump());
     });
 
     // 签发一次性邀请码(仅管理员)。返回 acecode://team/ 链接文本。
@@ -377,8 +475,19 @@ void WebServer::Impl::register_team() {
             port = body["port"].get<int>();
         if (port <= 0) return team_error(req, 502, "no_daemon_port");
 
-        const auto issued = team_service->issue_invite(team_id, addresses, port);
-        if (!issued) return team_error(req, issued.error == "not_admin" ? 403 : 500, issued.error);
+        const auto issued_result = team_service->issue_invite(team_id, addresses, port);
+        if (!issued_result) return team_error(req, issued_result.error == "not_admin" ? 403 : 500, issued_result.error);
+        auto issued = issued_result;
+        // 邀请码携带团队仓库身份(remote 类,最多 4 条):加入方在发起任何
+        // 网络连接之前用它预检本机工作目录,匹配失败不烧邀请码。
+        issued.invite.repos.clear();
+        if (const auto meta = team_service->load_team(team_id)) {
+            for (const auto& repo : meta->repos) {
+                if (repo.kind != "remote" || repo.value.empty()) continue;
+                if (issued.invite.repos.size() >= 4) break;
+                issued.invite.repos.push_back(repo);
+            }
+        }
         try {
             const auto link = team::encode_team_invite_link(issued.invite, team_service->now());
             return team_response(req, 200, json{{"link", link},
@@ -388,20 +497,60 @@ void WebServer::Impl::register_team() {
         }
     });
 
-    // 通过邀请链接加入(从邀请者拉全量快照)。
+    // 通过邀请链接加入(从邀请者拉全量快照)。必须指定本机工作目录:
+    // 邀请码携带团队仓库身份(remote 类)时,先在本机解析工作目录身份并
+    // 预检匹配 — 匹配失败不发起连接、不消费一次性邀请码。加入成功后
+    // 登记本机仓库身份并记住工作目录(每设备本地状态)。
     CROW_ROUTE(app, "/api/team/join").methods(crow::HTTPMethod::POST)
     ([this](const crow::request& req) {
         if (auto denied = require_auth(req)) return std::move(*denied);
         if (!team_service) return team_error(req, 503, "team_unavailable");
         const auto body = json::parse(req.body, nullptr, false);
-        if (!body.is_object() || !body.contains("link") || !body["link"].is_string())
-            return team_error(req, 400, "invalid_link");
+        if (const std::string invalid = web::validate_team_join_body(body); !invalid.empty())
+            return team_error(req, 400, invalid);
         const auto invite = team::decode_team_invite_link(body["link"].get<std::string>(),
                                                           team_service->now());
         if (!invite) return team_error(req, 400, invite.error);
+        const std::string cwd = body["cwd"].get<std::string>();
+
+        // 预检(网络连接之前):fetch 快照本身就会在邀请者侧消费邀请码并
+        // 登记成员,所以匹配必须前置,避免烧掉邀请码并留下幽灵成员。
+        std::optional<team::RepoIdentity> local_repo;
+        if (const auto resolved = team::resolve_repo_identity(cwd))
+            local_repo = resolved.identity;
+        if (!invite.value.repos.empty()) {
+            if (!local_repo) return team_error(req, 400, "workdir_not_git_repo");
+            const bool matched = std::any_of(invite.value.repos.begin(), invite.value.repos.end(),
+                [&](const team::RepoIdentity& candidate) {
+                    return candidate.kind == local_repo->kind &&
+                           candidate.value == local_repo->value;
+                });
+            if (!matched) return team_error(req, 400, "repo_mismatch");
+        }
+
         const auto fetcher = team::make_network_join_fetcher(team_service->self());
         const auto joined = team_service->join_team(invite.value, fetcher);
         if (!joined) return team_error(req, 502, joined.error);
+
+        // 复核 + 登记。快照在邀请码签发后可能补过仓库(极小概率):有仓库
+        // 却不匹配时删除本机刚落盘的数据再报错,不留半加入状态。
+        const auto meta = team_service->load_team(invite.value.team_id);
+        if (!meta) return team_error(req, 500, "team_not_found");
+        if (!meta->repos.empty()) {
+            if (!local_repo || !team::team_matches_repo(*meta, *local_repo)) {
+                std::error_code ec;
+                std::filesystem::remove_all(
+                    team_service->store_for(invite.value.team_id).root_dir(), ec);
+                return team_error(req, 400,
+                    local_repo ? "repo_mismatch" : "workdir_not_git_repo");
+            }
+        } else if (local_repo) {
+            (void)team_service->register_repo(invite.value.team_id, *local_repo);
+        }
+        team::TeamLocalState local;
+        local.work_dir = cwd;
+        team_service->store_for(invite.value.team_id).save_local_state(local);
+        broadcast_team_state(invite.value.team_id);
         return team_response(req, 200, json{{"team_id", invite.value.team_id}}.dump());
     });
 
@@ -492,9 +641,10 @@ void WebServer::Impl::register_team() {
         const auto body = json::parse(req.body, nullptr, false);
         if (const std::string invalid = web::validate_team_session_start_body(body); !invalid.empty())
             return team_error(req, 400, invalid);
-        // cwd 缺省 = daemon 工作目录(团队围绕本机项目使用)。
-        const std::string cwd = body["cwd"].is_string() && !body["cwd"].get<std::string>().empty()
-            ? body["cwd"].get<std::string>() : deps.cwd;
+        // cwd 缺省链:显式 cwd → 本机团队工作目录 → daemon 工作目录。
+        const auto local_state = team_service->store_for(team_id).load_local_state();
+        const std::string cwd = web::resolve_team_session_cwd(body, local_state.work_dir,
+                                                              deps.cwd);
         const std::string title = body.contains("title") && body["title"].is_string()
             ? body["title"].get<std::string>() : std::string{};
 
@@ -523,7 +673,8 @@ void WebServer::Impl::register_team() {
         ensure_team_session_subscriptions(team_id);
         broadcast_team_state(team_id);
         broadcast_team_session_event(team_id, "created", started.ref);
-        return team_response(req, 200, web::team_session_ref_public_json(started.ref).dump());
+        return team_response(req, 200,
+            team_session_ref_with_local_info(started.ref).dump());
     });
 
     // 结束/暂停团队会话。
@@ -611,7 +762,8 @@ void WebServer::Impl::register_team() {
         ensure_team_session_subscriptions(team_id);
         broadcast_team_state(team_id);
         broadcast_team_session_event(team_id, "host_changed", outcome.ref);
-        return team_response(req, 200, web::team_session_ref_public_json(outcome.ref).dump());
+        return team_response(req, 200,
+            team_session_ref_with_local_info(outcome.ref).dump());
     });
 
     // 本机 UI 给团队会话发消息(daemon token):转发到当前 host 设备。

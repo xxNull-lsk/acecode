@@ -1,6 +1,7 @@
 import './desktopOffice.test.js';
 import './inviteLink.test.js';
 import './teamSettings.test.js';
+import './teamSidebar.test.js';
 import './inviteClipboardStore.test.js';
 import './androidPhoneSettings.test.js';
 import './editingHistoryShortcuts.test.js';

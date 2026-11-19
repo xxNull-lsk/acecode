@@ -105,6 +105,59 @@ TEST(TeamHandler, ValidateSessionStartBody) {
     EXPECT_EQ(validate_team_session_start_body(json::parse("[]")), "invalid_body");
 }
 
+// 场景: 创建团队请求体校验(name + cwd 必填,repo_url 可选字符串)
+TEST(TeamHandler, ValidateTeamCreateBody) {
+    EXPECT_EQ(validate_team_create_body(
+        json::parse(R"({"name":"团队","cwd":"/tmp/x"})")), "");
+    EXPECT_EQ(validate_team_create_body(
+        json::parse(R"({"name":"团队","cwd":"/tmp/x","repo_url":"https://github.com/Org/Repo.git"})")), "");
+    EXPECT_EQ(validate_team_create_body(json::parse(R"({"cwd":"/tmp/x"})")), "invalid_name");
+    EXPECT_EQ(validate_team_create_body(json::parse(R"({"name":"团队"})")), "invalid_cwd");
+    EXPECT_EQ(validate_team_create_body(
+        json::parse(R"({"name":"团队","cwd":"/tmp/x","repo_url":1})")), "invalid_repo_url");
+    EXPECT_EQ(validate_team_create_body(json::parse("[]")), "invalid_body");
+}
+
+// 场景: 加入团队请求体校验(link + cwd 必填)
+TEST(TeamHandler, ValidateTeamJoinBody) {
+    EXPECT_EQ(validate_team_join_body(
+        json::parse(R"({"link":"acecode://team/x","cwd":"/tmp/x"})")), "");
+    EXPECT_EQ(validate_team_join_body(json::parse(R"({"cwd":"/tmp/x"})")), "invalid_link");
+    EXPECT_EQ(validate_team_join_body(json::parse(R"({"link":"acecode://team/x"})")), "invalid_cwd");
+    EXPECT_EQ(validate_team_join_body(json::parse("[]")), "invalid_body");
+}
+
+// 场景: 本机定位投影 — 本机会话补 cwd/workspace_hash,远程会话保持稀疏
+TEST(TeamHandler, SessionLocalInfoProjection) {
+    const auto local = team_session_local_info_json("/tmp/demo-repo", "abcd1234efgh5678");
+    EXPECT_EQ(local["cwd"], "/tmp/demo-repo");
+    EXPECT_EQ(local["workspace_hash"], "abcd1234efgh5678");
+
+    // no_workspace 会话:只有 cwd,不绑定工作区
+    const auto no_ws = team_session_local_info_json("/tmp/scratch", "");
+    EXPECT_EQ(no_ws["cwd"], "/tmp/scratch");
+    EXPECT_FALSE(no_ws.contains("workspace_hash"));
+
+    EXPECT_TRUE(team_session_local_info_json("", "").empty());
+}
+
+// 场景: 发起会话 cwd 缺省链 — 显式 cwd > 本机团队工作目录 > daemon 兜底
+TEST(TeamHandler, ResolveSessionCwdChain) {
+    const json explicit_cwd = json::parse(R"({"cwd":"/explicit"})");
+    EXPECT_EQ(resolve_team_session_cwd(explicit_cwd, "/workdir", "/daemon"), "/explicit");
+
+    const json no_cwd = json::parse("{}");
+    EXPECT_EQ(resolve_team_session_cwd(no_cwd, "/workdir", "/daemon"), "/workdir");
+    EXPECT_EQ(resolve_team_session_cwd(no_cwd, "", "/daemon"), "/daemon");
+
+    // cwd 显式为空串视同缺省
+    const json blank_cwd = json::parse(R"({"cwd":""})");
+    EXPECT_EQ(resolve_team_session_cwd(blank_cwd, "/workdir", "/daemon"), "/workdir");
+
+    // 非对象 body 一律走缺省链
+    EXPECT_EQ(resolve_team_session_cwd(json::array(), "/workdir", "/daemon"), "/workdir");
+}
+
 // 3.3 场景: 同一 host 会话的两个订阅者看到完全一致的事件顺序
 // (团队 WS 路由下,每个队员连接都挂在同一个 EventDispatcher 上,
 //  顺序由 dispatcher 的 seq 单调 + catch-up 机制保证)。

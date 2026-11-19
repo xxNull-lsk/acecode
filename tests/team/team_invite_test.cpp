@@ -6,6 +6,8 @@
 
 #include "team/team_invite.hpp"
 
+#include <stdexcept>
+
 namespace acecode::team {
 
 namespace {
@@ -54,6 +56,38 @@ TEST(TeamInvite, ExtractFromText) {
     // 宽松提取忽略前后标点;链接主体是 url64 字符集,直接可识别。
     ASSERT_TRUE(decoded) << decoded.error;
     EXPECT_EQ(decoded.value.team_id, "team-1");
+}
+
+// 场景: 邀请码可携带团队仓库身份(remote 类),往返解码逐条相同
+TEST(TeamInvite, RoundTripCarriesRepos) {
+    const std::int64_t now = 1'700'000'000;
+    auto invite = sample_invite(now);
+    invite.repos = {{"remote", "github.com/Org/Repo"}, {"remote", "gitlab.com/a/b"}};
+    const auto decoded = decode_team_invite_link(encode_team_invite_link(invite, now), now);
+    ASSERT_TRUE(decoded) << decoded.error;
+    ASSERT_EQ(decoded.value.repos.size(), 2u);
+    EXPECT_EQ(decoded.value.repos[0].kind, "remote");
+    EXPECT_EQ(decoded.value.repos[0].value, "github.com/Org/Repo");
+    EXPECT_EQ(decoded.value.repos[1].value, "gitlab.com/a/b");
+}
+
+// 场景: 旧格式(无 r 字段)解码为空仓库,向后兼容
+TEST(TeamInvite, LegacyLinkWithoutReposDecodesEmpty) {
+    const std::int64_t now = 1'700'000'000;
+    const auto decoded = decode_team_invite_link(encode_team_invite_link(sample_invite(now), now), now);
+    ASSERT_TRUE(decoded) << decoded.error;
+    EXPECT_TRUE(decoded.value.repos.empty());
+}
+
+// 场景: 载荷校验拒绝 local-id 条目与超量条目
+TEST(TeamInvite, InvalidReposRejected) {
+    const std::int64_t now = 1'700'000'000;
+    auto invite = sample_invite(now);
+    invite.repos = {{"local-id", "uuid-1"}};
+    EXPECT_THROW(encode_team_invite_link(invite, now), std::invalid_argument);
+
+    invite.repos.assign(5, {"remote", "github.com/Org/Repo"});
+    EXPECT_THROW(encode_team_invite_link(invite, now), std::invalid_argument);
 }
 
 // 场景: 链接被聊天软件截断 → 校验值不匹配

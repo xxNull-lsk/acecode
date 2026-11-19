@@ -99,18 +99,21 @@ export const SIDEBAR_SECTION_IDS = Object.freeze({
   PINNED: 'pinned',
   TASKS: 'tasks',
   WORKSPACES: 'workspaces',
+  TEAMS: 'teams',
 });
 
 export const SIDEBAR_SECTION_LABELS = Object.freeze({
   [SIDEBAR_SECTION_IDS.PINNED]: '置顶',
   [SIDEBAR_SECTION_IDS.TASKS]: '任务',
   [SIDEBAR_SECTION_IDS.WORKSPACES]: '工作区',
+  [SIDEBAR_SECTION_IDS.TEAMS]: '团队',
 });
 
 export const DEFAULT_SIDEBAR_SECTION_EXPANSION = Object.freeze({
   [SIDEBAR_SECTION_IDS.PINNED]: true,
   [SIDEBAR_SECTION_IDS.TASKS]: true,
   [SIDEBAR_SECTION_IDS.WORKSPACES]: true,
+  [SIDEBAR_SECTION_IDS.TEAMS]: true,
 });
 
 export const SIDEBAR_DISCLOSURE_ICON = Object.freeze({
@@ -118,20 +121,37 @@ export const SIDEBAR_DISCLOSURE_ICON = Object.freeze({
   size: 18,
 });
 
+// 校验放宽为"已知分组键必须为布尔,允许缺键"(add-team-workdir-sidebar):
+// 旧持久化数据没有 teams 键仍然有效,缺的键由 normalize 补默认展开,
+// 避免升级把用户已有的折叠偏好整体重置。
 export function validateSidebarSectionExpansion(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  return Object.values(SIDEBAR_SECTION_IDS).every((id) => typeof value[id] === 'boolean');
+  const known = new Set(Object.values(SIDEBAR_SECTION_IDS));
+  return Object.entries(value).every(([id, flag]) => known.has(id) && typeof flag === 'boolean');
+}
+
+// 补齐缺键(含 teams):只认已知 id,未知键丢弃。
+export function normalizeSidebarSectionExpansion(value) {
+  const merged = { ...DEFAULT_SIDEBAR_SECTION_EXPANSION };
+  if (validateSidebarSectionExpansion(value)) {
+    for (const id of Object.values(SIDEBAR_SECTION_IDS)) {
+      if (typeof value[id] === 'boolean') merged[id] = value[id];
+    }
+  }
+  return merged;
 }
 
 export function sidebarSectionCounts({
   pinnedSessions = [],
   noWorkspaceSessions = [],
   workspaces = [],
+  teams = [],
 } = {}) {
   return {
     [SIDEBAR_SECTION_IDS.PINNED]: Array.isArray(pinnedSessions) ? pinnedSessions.length : 0,
     [SIDEBAR_SECTION_IDS.TASKS]: Array.isArray(noWorkspaceSessions) ? noWorkspaceSessions.length : 0,
     [SIDEBAR_SECTION_IDS.WORKSPACES]: Array.isArray(workspaces) ? workspaces.length : 0,
+    [SIDEBAR_SECTION_IDS.TEAMS]: Array.isArray(teams) ? teams.length : 0,
   };
 }
 

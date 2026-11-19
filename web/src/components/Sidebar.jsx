@@ -148,11 +148,20 @@ import {
 // hover 卡片与 GitSessionPill 共用同一份 git info 缓存(见 gitInfoCache.js)。
 import { gitInfoCache } from '../lib/gitInfoCache.js';
 import { sessionWorkbench } from '../lib/sessionWorkbench.js';
+// 团队侧边栏分组(add-team-workdir-sidebar):状态投影纯逻辑。
+import {
+  teamSessionListProjection,
+  teamSessionOpenTarget,
+  teamSessionStateView,
+  teamSidebarSessionRows,
+  teamSidebarTeam,
+} from '../lib/teamSidebar.js';
 import {
   DEFAULT_SIDEBAR_SECTION_EXPANSION,
   SIDEBAR_DISCLOSURE_ICON,
   SIDEBAR_NAV_ITEMS,
   SIDEBAR_SECTION_IDS,
+  normalizeSidebarSectionExpansion,
   sidebarSectionCounts,
   sidebarSectionIsVisible,
   sidebarSectionTitle,
@@ -1888,6 +1897,148 @@ function NoWorkspaceSessionGroup({
   );
 }
 
+// 团队会话行(add-team-workdir-sidebar):标题 + 状态点 + host 标识。
+// 本机会话整行可点直接打开;远程托管会话不打开,显式提供接管按钮。
+function TeamSessionRow({ row, hostLabel, active, onSelect, onTakeover, takeoverBusy }) {
+  const view = teamSessionStateView(row);
+  return (
+    <div
+      data-sidebar-team-session={row.id}
+      className="ace-sidebar-tree-row-grid grid grid-cols-[24px_minmax(0,1fr)_auto] items-center gap-x-[7px] mx-1.5 pl-[3px] pr-[14px] py-[4px] rounded-md text-[13px] transition hover:bg-surface-hi"
+    >
+      <span aria-hidden="true" />
+      <div className="min-w-0">
+        {row.isLocal ? (
+          <button
+            type="button"
+            onClick={() => onSelect(row)}
+            className={clsx(
+              'ace-sidebar-tree-content block w-full text-left px-0 py-[3px] rounded-md truncate transition-colors',
+              active ? 'text-fg font-medium' : 'text-fg hover:text-fg',
+            )}
+            title={row.title}
+          >
+            {row.title}
+          </button>
+        ) : (
+          <span className="ace-sidebar-tree-content block truncate px-0 py-[3px] text-fg" title={row.title}>
+            {row.title}
+          </span>
+        )}
+      </div>
+      <span className="flex items-center gap-1.5 shrink-0 text-[11px] text-fg-mute">
+        <span>{hostLabel}</span>
+        <span
+          role="img"
+          aria-label={view.label}
+          title={view.label}
+          className={clsx('w-1.5 h-1.5 rounded-full shrink-0', {
+            'bg-ok': view.tone === 'ok',
+            'bg-warn': view.tone === 'warn',
+            'bg-fg-mute': view.tone === 'mute',
+          })}
+        />
+        {!row.isLocal && (
+          <button
+            type="button"
+            disabled={takeoverBusy}
+            onClick={() => onTakeover(row)}
+            className="px-1 py-0.5 rounded text-fg-mute hover:text-fg hover:bg-surface-hi transition disabled:opacity-50"
+            title="接管到本机"
+          >接管</button>
+        )}
+      </span>
+    </div>
+  );
+}
+
+// 团队分组:团队行 + 可展开的团队会话列表(与工作区分组并列)。
+// 会话数据来自 GET /api/team 的团队状态投影(本机定位投影已由 daemon 合入),
+// 不进普通 sessions 列表,也没有置顶/拖拽/悬停卡等本机会话交互。
+function TeamGroup({
+  team,
+  expanded,
+  onToggle,
+  visibleLimit,
+  onToggleSessionList,
+  activeId,
+  onSelect,
+  onTakeover,
+  takeoverBusySessionId,
+}) {
+  const view = teamSidebarTeam(team);
+  if (!view) return null;
+  const rows = teamSidebarSessionRows(team);
+  const projected = teamSessionListProjection(rows, visibleLimit);
+  const listKey = `team:${view.teamId}`;
+  return (
+    <div>
+      <div
+        className="ace-sidebar-tree-row-grid ace-sidebar-primary-text group grid grid-cols-[24px_minmax(0,1fr)_auto] items-center gap-x-[7px] mx-1.5 pl-[3px] pr-[14px] py-[3px] rounded-md text-[14px] cursor-pointer transition text-fg hover:bg-surface-hi"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        onClick={() => onToggle(view.teamId)}
+        onKeyDown={(event) => {
+          if (event.target !== event.currentTarget) return;
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            onToggle(view.teamId);
+          }
+        }}
+      >
+        <span className="w-6 h-6 flex items-center justify-center shrink-0">
+          <VsIcon name="antenna" size={16} />
+        </span>
+        <span className="ace-sidebar-tree-content min-w-0 truncate font-normal">{view.name}</span>
+        <span className="flex items-center justify-end gap-1 shrink-0 text-[12px] text-fg-mute pr-[3px]">
+          {view.sessionCount > 0 && <span className="tabular-nums">{view.sessionCount}</span>}
+          <SidebarDisclosure expanded={expanded} />
+        </span>
+      </div>
+      {expanded && (
+        <div className="mt-px mb-[10px]">
+          {rows.length === 0 ? (
+            <div className="ace-sidebar-tree-row-grid ace-sidebar-meta-text grid grid-cols-[24px_minmax(0,1fr)_auto] items-center gap-x-[7px] mx-1.5 pl-[3px] pr-[14px] py-[4px] text-[13px] text-fg-mute italic">
+              <span aria-hidden="true" />
+              <span>暂无团队会话</span>
+            </div>
+          ) : (
+            <>
+              {projected.visibleRows.map((row) => {
+                const hostSelf = team.self?.guid && row.hostGuid === team.self.guid;
+                return (
+                  <TeamSessionRow
+                    key={row.id}
+                    row={row}
+                    active={row.isLocal && row.id === activeId}
+                    hostLabel={hostSelf ? '本机' : '远程'}
+                    onSelect={onSelect}
+                    onTakeover={onTakeover}
+                    takeoverBusy={takeoverBusySessionId === row.id}
+                  />
+                );
+              })}
+              {projected.action && (
+                <div className="ace-sidebar-tree-row-grid grid grid-cols-[24px_minmax(0,1fr)_auto] items-center gap-x-[7px] mx-1.5 pl-[3px] pr-[14px]">
+                  <span aria-hidden="true" />
+                  <button
+                    type="button"
+                    onClick={() => onToggleSessionList?.(listKey, projected.action)}
+                    className="ace-sidebar-tree-content ace-sidebar-meta-text px-0 py-[5px] rounded-md text-left text-[13px] text-fg-mute hover:text-fg transition-colors"
+                  >
+                    {projected.action === 'expand' ? `展开显示 (${projected.total})` : '折叠显示'}
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function Sidebar({
   activeId,
   activeRef,
@@ -1984,11 +2135,69 @@ export function Sidebar({
   const treeRevealRequestedRef = useRef('');
   const expandedSessionListsRef = useRef(expandedSessionLists);
   expandedSessionListsRef.current = expandedSessionLists;
-  const [sectionExpansion, setSectionExpansion] = usePreference(
+  const [sectionExpansionPreference, setSectionExpansion] = usePreference(
     SIDEBAR_SECTIONS_STORAGE_KEY,
     DEFAULT_SIDEBAR_SECTION_EXPANSION,
     validateSidebarSectionExpansion,
   );
+  // 旧持久化数据缺 teams 键:渲染前补默认展开,避免升级重置既有折叠偏好。
+  const sectionExpansion = useMemo(
+    () => normalizeSidebarSectionExpansion(sectionExpansionPreference),
+    [sectionExpansionPreference],
+  );
+
+  // 团队分组数据(add-team-workdir-sidebar):GET /api/team 的只读投影。
+  // 挂载拉一次;设置页创建/加入团队后经 acecode:teams-changed 通知刷新;
+  // 分组展开且可见时低频轮询,保持团队会话列表与状态可看。
+  const [teamStates, setTeamStates] = useState([]);
+  const teamsLoadSeqRef = useRef(0);
+  const loadTeams = useStableCallback(async () => {
+    const seq = ++teamsLoadSeqRef.current;
+    try {
+      const result = await api.listTeams();
+      if (seq !== teamsLoadSeqRef.current) return;
+      setTeamStates(Array.isArray(result?.teams) ? result.teams : []);
+    } catch { /* 失败保留上次数据,侧边栏不因团队接口阻塞 */ }
+  });
+  const [expandedTeamGroups, setExpandedTeamGroups] = useState(() => new Set());
+  const toggleTeamGroup = useStableCallback((teamId) => {
+    setExpandedTeamGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(teamId)) next.delete(teamId); else next.add(teamId);
+      return next;
+    });
+  });
+  const [teamTakeoverBusyId, setTeamTakeoverBusyId] = useState('');
+  useEffect(() => { loadTeams(); }, [loadTeams]);
+  useEffect(() => {
+    window.addEventListener('acecode:teams-changed', loadTeams);
+    return () => window.removeEventListener('acecode:teams-changed', loadTeams);
+  }, [loadTeams]);
+
+  // 从侧边栏发起接管:与设置页同一流程(先确保本机仓库已登记,再接管)。
+  const takeoverTeamSessionFromSidebar = useStableCallback(async (teamId, sessionId) => {
+    setTeamTakeoverBusyId(sessionId);
+    try {
+      try { await api.linkTeamRepo(teamId, ''); } catch { /* 接管侧仍会校验 */ }
+      await api.takeoverTeamSession(teamId, sessionId, '');
+      toast({ kind: 'ok', text: '会话已接管到本机' });
+      loadTeams();
+    } catch (e) {
+      const code = e?.body?.error || '';
+      const mapped = {
+        member_offline: '源设备不在线,可改用最近副本(源设备上线前不可取数)',
+        quota_exhausted: '本机当日额度已用尽',
+        repo_not_linked: '本机仓库未关联到团队',
+        data_unavailable: '取不到源会话数据',
+        no_replica: '没有最近会话副本',
+        session_ended: '会话已结束',
+        already_host: '会话已在本机',
+      };
+      toast({ kind: 'err', text: mapped[code] || '接管失败,请重试' });
+    } finally {
+      setTeamTakeoverBusyId('');
+    }
+  });
   const [activeWorkspaceHash, setActiveWorkspaceHash] = useStructuralState('');
   const refreshSelectionRef = useRef(null);
   const refreshingRef = useRef(false);
@@ -3332,9 +3541,17 @@ export function Sidebar({
       pinnedSessions,
       noWorkspaceSessions: sidebarSessionRoots(unpinnedNoWorkspaceSessions),
       workspaces,
+      teams: teamStates,
     }),
-    [pinnedSessions, unpinnedNoWorkspaceSessions, workspaces],
+    [pinnedSessions, unpinnedNoWorkspaceSessions, workspaces, teamStates],
   );
+
+  // 团队分组展开时低频轮询(团队会话状态在别处变更也能看到)。
+  useEffect(() => {
+    if (!sectionExpansion.teams || !sidebarSectionIsVisible(sectionCounts.teams)) return undefined;
+    const timer = setInterval(loadTeams, 15000);
+    return () => clearInterval(timer);
+  }, [loadTeams, sectionExpansion.teams, sectionCounts.teams]);
 
   useEffect(() => {
     if (!selectedRevealTarget.sessionId) {
@@ -4492,6 +4709,38 @@ export function Sidebar({
                     />
                   );
                 })}
+              </div>
+            )}
+            <SidebarSectionHeader
+              sectionId={SIDEBAR_SECTION_IDS.TEAMS}
+              count={sectionCounts.teams}
+              expanded={sectionExpansion.teams}
+              onToggle={() => toggleSidebarSection(SIDEBAR_SECTION_IDS.TEAMS)}
+            />
+            {sidebarSectionIsVisible(sectionCounts.teams) && sectionExpansion.teams && (
+              <div className="my-1">
+                {teamStates.map((team) => (
+                  <TeamGroup
+                    key={team.team_id}
+                    team={team}
+                    expanded={expandedTeamGroups.has(team.team_id)}
+                    onToggle={toggleTeamGroup}
+                    visibleLimit={expandedSessionLists.get(`team:${team.team_id}`)}
+                    onToggleSessionList={toggleSessionListExpanded}
+                    activeId={activeId}
+                    onSelect={(row) => {
+                      if (suppressSessionClickRef.current) return;
+                      const target = teamSessionOpenTarget(row);
+                      if (!target) return;
+                      selectSession(
+                        target.noWorkspace ? { noWorkspace: true } : { hash: target.workspaceHash },
+                        { id: row.id, workspace_hash: target.workspaceHash, cwd: target.cwd, title: row.title },
+                      );
+                    }}
+                    onTakeover={(row) => takeoverTeamSessionFromSidebar(team.team_id, row.id)}
+                    takeoverBusySessionId={teamTakeoverBusyId}
+                  />
+                ))}
               </div>
             )}
           </div>

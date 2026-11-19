@@ -10,6 +10,8 @@
 #include <string_view>
 #include <vector>
 
+#include "team/team_meta.hpp"
+
 namespace acecode::team {
 
 // 邀请码 TTL:创建起最多 15 分钟(spec: 邀请码有效期)。编码侧据此钳制,
@@ -28,6 +30,10 @@ struct TeamInviteLink {
     int port = 0;
     std::string token;           // 一次性 token
     std::int64_t expires_at = 0; // Unix 秒,与 share 链接同口径
+    // 团队已登记仓库身份(仅 remote 类,最多 4 条):加入方在发起任何网络
+    // 连接之前用它预检本机工作目录,匹配失败不烧邀请码。旧邀请码无此字段
+    // 解码为空(跳过匹配),向后兼容。
+    std::vector<RepoIdentity> repos;
 };
 
 struct TeamInviteDecodeResult {

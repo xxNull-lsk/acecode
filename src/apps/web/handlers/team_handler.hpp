@@ -37,4 +37,23 @@ nlohmann::json team_state_json(const team::TeamMeta& meta,
 // POST /api/team/<id>/session 请求体校验:cwd 必填。返回 error 空串 = 合法。
 std::string validate_team_session_start_body(const nlohmann::json& body);
 
+// POST /api/team 请求体校验:name 与 cwd 必填,repo_url 可选字符串。
+std::string validate_team_create_body(const nlohmann::json& body);
+
+// POST /api/team/join 请求体校验:link 与 cwd 必填。
+std::string validate_team_join_body(const nlohmann::json& body);
+
+// 团队会话发起 cwd 缺省链:显式 cwd → 本机团队工作目录 → 兜底(daemon
+// 工作目录)。返回最终生效的 cwd。
+std::string resolve_team_session_cwd(const nlohmann::json& body,
+                                     const std::string& local_work_dir,
+                                     const std::string& fallback);
+
+// 团队会话引用的本机定位投影:cwd/workspace_hash 由路由层从本机会话
+// meta 读出后传入,返回 {cwd, workspace_hash} 覆盖层,供侧边栏把本机
+// 存在的会话当普通会话打开;两者皆空返回空对象(远程托管的会话保持
+// 稀疏)。no_workspace 会话只带 cwd、不带 workspace_hash。
+nlohmann::json team_session_local_info_json(const std::string& cwd,
+                                            const std::string& workspace_hash);
+
 } // namespace acecode::web

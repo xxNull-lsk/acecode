@@ -24,6 +24,7 @@ import {
 } from '../lib/teamSettings.js';
 import { DEFAULT_DAILY_TOKEN_QUOTA } from '../lib/teamConstants.js';
 import { Modal } from './Modal.jsx';
+import { VsIcon } from './Icon.jsx';
 import { toast } from './Toast.jsx';
 
 const NOW_MS_INTERVAL = 1000;
@@ -47,6 +48,12 @@ function errText(e) {
       connection_failed: '连接失败,请检查网络',
       no_lan_address: '未发现可用的局域网地址',
       no_daemon_port: 'daemon 端口未知',
+      invalid_name: '请填写团队名称',
+      invalid_cwd: '请填写工作目录',
+      invalid_link: '请粘贴有效的邀请链接',
+      invalid_repo_url: '仓库 URL 无效:请填写可跨设备复用的远程仓库地址',
+      workdir_not_git_repo: '工作目录不是 git 仓库,请填写远程仓库 URL',
+      repo_mismatch: '工作目录与团队仓库不匹配:请检出团队仓库后重试',
     };
     return mapped[code] || e.message || '请求失败,请重试';
   }
@@ -72,7 +79,9 @@ export function TeamSettings() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState('');
   const busyRef = useRef('');
-  const [newTeamName, setNewTeamName] = useState('');
+  // 创建/加入弹框表单(add-team-workdir-sidebar):null = 关闭。
+  const [createModal, setCreateModal] = useState(null); // { name, cwd, repoUrl, error, busy }
+  const [joinModal, setJoinModal] = useState(null); // { link, cwd, error, busy }
   const [invite, setInvite] = useState(null); // { link, expires_at, team_id }
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
   const [quotaDraft, setQuotaDraft] = useState(null); // 字符串输入草稿(仅自己)
@@ -180,14 +189,25 @@ export function TeamSettings() {
   // 会话事件的提示(暂停原因 / host 切换)在 WS onmessage 回调里发。
   // 这里不重复监听 connection 全局事件:团队状态走专用 /ws/team 连接。
 
-  const createTeam = () => run('create', async () => {
-    const meta = await api.createTeam(newTeamName.trim());
-    setNewTeamName('');
+  // 创建团队:名称 + 工作目录(是 git 仓库时可省略仓库 URL,否则必填,
+  // 以后端校验为准)。成功后切到新团队。
+  const submitCreate = async () => {
+    const form = createModal;
+    if (!form || form.busy) return;
+    const name = form.name.trim();
+    const cwd = form.cwd.trim();
+    if (!name) { setCreateModal({ ...form, error: '请填写团队名称' }); return; }
+    if (!cwd) { setCreateModal({ ...form, error: '请填写工作目录' }); return; }
+    setCreateModal({ ...form, busy: true, error: '' });
+    const meta = await run('create', () => api.createTeam(name, { cwd, repoUrl: form.repoUrl.trim() }),
+      { onError: (message) => setCreateModal((prev) => (prev ? { ...prev, busy: false, error: message } : prev)) });
+    if (!meta) return;
+    setCreateModal(null);
     await load();
+    window.dispatchEvent(new CustomEvent('acecode:teams-changed'));
     setState((prev) => ({ ...prev, activeTeamId: meta.team_id }));
     toast({ kind: 'ok', text: '团队已创建' });
-    return meta;
-  });
+  };
 
   const issueInvite = () => {
     if (!activeTeam) return;
@@ -199,14 +219,23 @@ export function TeamSettings() {
     });
   };
 
-  const joinTeam = () => {
-    const link = window.prompt('粘贴 acecode://team/ 邀请链接');
-    if (!link) return;
-    run('join', async () => {
-      await api.joinTeam(link.trim());
-      await load();
-      toast({ kind: 'ok', text: '已加入团队' });
-    });
+  // 加入团队:邀请链接 + 本机工作目录。git 仓库从团队信息自动匹配,
+  // 不匹配(目录未检出团队仓库)时后端拒绝并提示原因。
+  const submitJoin = async () => {
+    const form = joinModal;
+    if (!form || form.busy) return;
+    const link = form.link.trim();
+    const cwd = form.cwd.trim();
+    if (!link) { setJoinModal({ ...form, error: '请粘贴邀请链接' }); return; }
+    if (!cwd) { setJoinModal({ ...form, error: '请填写工作目录' }); return; }
+    setJoinModal({ ...form, busy: true, error: '' });
+    const ok = await run('join', () => api.joinTeam(link, cwd),
+      { onError: (message) => setJoinModal((prev) => (prev ? { ...prev, busy: false, error: message } : prev)) });
+    if (!ok) return;
+    setJoinModal(null);
+    await load();
+    window.dispatchEvent(new CustomEvent('acecode:teams-changed'));
+    toast({ kind: 'ok', text: '已加入团队' });
   };
 
   const copyInvite = async () => {
@@ -246,7 +275,7 @@ export function TeamSettings() {
     if (!activeTeam) return;
     run('start-session', async () => {
       // 仓库未关联时先关联本机项目再重试一次。
-      const start = () => api.startTeamSession(activeTeam.team_id, { title: newTeamName.trim() || '' });
+      const start = () => api.startTeamSession(activeTeam.team_id, {});
       let ref;
       try {
         ref = await start();
@@ -312,23 +341,16 @@ export function TeamSettings() {
       {!loading && !activeTeam && (
         <div className="max-w-md">
           <div className="flex items-center gap-2 px-3.5 py-2.5 rounded-md bg-surface border border-border mb-2">
-            <input
-              value={newTeamName}
-              onChange={(e) => setNewTeamName(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') createTeam(); }}
-              placeholder="团队名称"
-              className="flex-1 h-7 px-2 text-[13px] rounded-md border border-border bg-surface-alt text-fg outline-none focus:border-accent transition"
-            />
             <button
               type="button"
               disabled={busy === 'create'}
-              onClick={createTeam}
+              onClick={() => setCreateModal({ name: '', cwd: '', repoUrl: '', error: '', busy: false })}
               className="px-3 py-1 bg-accent text-white rounded disabled:opacity-60"
             >创建团队</button>
             <button
               type="button"
               disabled={busy === 'join'}
-              onClick={joinTeam}
+              onClick={() => setJoinModal({ link: '', cwd: '', error: '', busy: false })}
               className="px-3 py-1 rounded border border-border text-[13px] text-fg hover:bg-surface-hi transition disabled:opacity-60"
             >加入团队</button>
           </div>
@@ -530,7 +552,7 @@ export function TeamSettings() {
           <button
             type="button"
             disabled={busy === 'join'}
-            onClick={joinTeam}
+            onClick={() => setJoinModal({ link: '', cwd: '', error: '', busy: false })}
             className="mt-2 px-3 py-1 rounded border border-border text-[13px] text-fg hover:bg-surface-hi transition disabled:opacity-60"
           >粘贴邀请链接加入</button>
         </>
@@ -561,6 +583,158 @@ export function TeamSettings() {
               );
             })}
           </div>
+        </Modal>
+      )}
+
+      {/* 创建团队:名称 + 工作目录(是 git 仓库时可省略仓库 URL) */}
+      {createModal && (
+        <Modal onClose={() => setCreateModal(null)} width={520} dismissOnBackdrop={false} labelledBy="team-create-title">
+          {({ close }) => (
+            <form
+              onSubmit={(event) => { event.preventDefault(); submitCreate(); }}
+              className="ace-modal-form"
+            >
+              <div className="shrink-0 px-5 py-4 border-b border-border flex items-start gap-3">
+                <div className="w-9 h-9 rounded-lg bg-accent/10 text-accent flex items-center justify-center shrink-0">
+                  <VsIcon name="antenna" size={19} />
+                </div>
+                <div className="min-w-0">
+                  <h2 id="team-create-title" className="text-[15px] font-semibold text-fg">创建团队</h2>
+                  <p className="mt-0.5 text-[12px] leading-5 text-fg-mute">
+                    团队围绕一个工作目录与 git 仓库协作。
+                  </p>
+                </div>
+              </div>
+              <div className="min-h-0 overflow-y-auto ace-scrollbar px-5 py-4 space-y-4">
+                <label className="block">
+                  <span className="block mb-1.5 text-[12px] font-medium text-fg">团队名称</span>
+                  <input
+                    value={createModal.name}
+                    onChange={(e) => setCreateModal((prev) => ({ ...prev, name: e.target.value, error: '' }))}
+                    maxLength={128}
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="w-full h-9 px-3 rounded-lg border border-border bg-bg text-[13px] text-fg outline-none focus:border-accent focus:ring-1 focus:ring-accent"
+                  />
+                </label>
+                <label className="block">
+                  <span className="block mb-1.5 text-[12px] font-medium text-fg">工作目录</span>
+                  <input
+                    value={createModal.cwd}
+                    onChange={(e) => setCreateModal((prev) => ({ ...prev, cwd: e.target.value, error: '' }))}
+                    autoComplete="off"
+                    spellCheck={false}
+                    placeholder="/home/user/project"
+                    className="w-full h-9 px-3 rounded-lg border border-border bg-bg text-[13px] font-mono text-fg outline-none focus:border-accent focus:ring-1 focus:ring-accent placeholder:text-fg-mute/60"
+                  />
+                </label>
+                <label className="block">
+                  <span className="block mb-1.5 text-[12px] font-medium text-fg">git 仓库 URL(选填)</span>
+                  <input
+                    value={createModal.repoUrl}
+                    onChange={(e) => setCreateModal((prev) => ({ ...prev, repoUrl: e.target.value, error: '' }))}
+                    autoComplete="off"
+                    spellCheck={false}
+                    placeholder="https://github.com/org/repo.git"
+                    className="w-full h-9 px-3 rounded-lg border border-border bg-bg text-[13px] font-mono text-fg outline-none focus:border-accent focus:ring-1 focus:ring-accent placeholder:text-fg-mute/60"
+                  />
+                  <span className="block mt-1.5 text-[11px] leading-5 text-fg-mute">
+                    工作目录是 git 仓库时自动从目录解析;不是 git 仓库时必填。
+                  </span>
+                </label>
+                {createModal.error && (
+                  <div role="alert" className="px-3 py-2 rounded-lg border border-danger/30 bg-surface text-[12px] leading-5 text-danger">
+                    {createModal.error}
+                  </div>
+                )}
+              </div>
+              <div className="shrink-0 px-5 py-3 border-t border-border bg-surface-alt flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={close}
+                  className="h-8 px-3 rounded-lg text-[12px] text-fg hover:bg-surface-hi"
+                >取消</button>
+                <button
+                  type="submit"
+                  data-ace-dialog-primary="true"
+                  disabled={createModal.busy}
+                  className="h-8 min-w-[82px] px-3 rounded-lg bg-accent text-white text-[12px] font-medium hover:brightness-110 disabled:opacity-50 flex items-center justify-center gap-1.5"
+                >
+                  {createModal.busy && <span className="ace-spinner w-3 h-3" />}
+                  {createModal.busy ? '创建中…' : '创建团队'}
+                </button>
+              </div>
+            </form>
+          )}
+        </Modal>
+      )}
+
+      {/* 加入团队:邀请链接 + 工作目录;git 仓库从团队信息自动匹配 */}
+      {joinModal && (
+        <Modal onClose={() => setJoinModal(null)} width={520} dismissOnBackdrop={false} labelledBy="team-join-title">
+          {({ close }) => (
+            <form
+              onSubmit={(event) => { event.preventDefault(); submitJoin(); }}
+              className="ace-modal-form"
+            >
+              <div className="shrink-0 px-5 py-4 border-b border-border flex items-start gap-3">
+                <div className="w-9 h-9 rounded-lg bg-accent/10 text-accent flex items-center justify-center shrink-0">
+                  <VsIcon name="antenna" size={19} />
+                </div>
+                <div className="min-w-0">
+                  <h2 id="team-join-title" className="text-[15px] font-semibold text-fg">加入团队</h2>
+                  <p className="mt-0.5 text-[12px] leading-5 text-fg-mute">
+                    git 仓库从团队信息自动匹配,需先在本机检出团队仓库。
+                  </p>
+                </div>
+              </div>
+              <div className="min-h-0 overflow-y-auto ace-scrollbar px-5 py-4 space-y-4">
+                <label className="block">
+                  <span className="block mb-1.5 text-[12px] font-medium text-fg">邀请链接</span>
+                  <input
+                    value={joinModal.link}
+                    onChange={(e) => setJoinModal((prev) => ({ ...prev, link: e.target.value, error: '' }))}
+                    autoComplete="off"
+                    spellCheck={false}
+                    placeholder="acecode://team/…"
+                    className="w-full h-9 px-3 rounded-lg border border-border bg-bg text-[13px] font-mono text-fg outline-none focus:border-accent focus:ring-1 focus:ring-accent placeholder:text-fg-mute/60"
+                  />
+                </label>
+                <label className="block">
+                  <span className="block mb-1.5 text-[12px] font-medium text-fg">工作目录</span>
+                  <input
+                    value={joinModal.cwd}
+                    onChange={(e) => setJoinModal((prev) => ({ ...prev, cwd: e.target.value, error: '' }))}
+                    autoComplete="off"
+                    spellCheck={false}
+                    placeholder="/home/user/project"
+                    className="w-full h-9 px-3 rounded-lg border border-border bg-bg text-[13px] font-mono text-fg outline-none focus:border-accent focus:ring-1 focus:ring-accent placeholder:text-fg-mute/60"
+                  />
+                </label>
+                {joinModal.error && (
+                  <div role="alert" className="px-3 py-2 rounded-lg border border-danger/30 bg-surface text-[12px] leading-5 text-danger">
+                    {joinModal.error}
+                  </div>
+                )}
+              </div>
+              <div className="shrink-0 px-5 py-3 border-t border-border bg-surface-alt flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={close}
+                  className="h-8 px-3 rounded-lg text-[12px] text-fg hover:bg-surface-hi"
+                >取消</button>
+                <button
+                  type="submit"
+                  data-ace-dialog-primary="true"
+                  disabled={joinModal.busy}
+                  className="h-8 min-w-[82px] px-3 rounded-lg bg-accent text-white text-[12px] font-medium hover:brightness-110 disabled:opacity-50 flex items-center justify-center gap-1.5"
+                >
+                  {joinModal.busy && <span className="ace-spinner w-3 h-3" />}
+                  {joinModal.busy ? '加入中…' : '加入团队'}
+                </button>
+              </div>
+            </form>
+          )}
         </Modal>
       )}
     </div>

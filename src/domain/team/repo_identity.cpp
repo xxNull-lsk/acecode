@@ -154,4 +154,16 @@ bool team_matches_repo(const TeamMeta& meta, const RepoIdentity& identity) {
         });
 }
 
+RepoIdentityResult repo_identity_from_url(const std::string& url) {
+    RepoIdentityResult result;
+    const std::string normalized = normalize_git_remote_url(url);
+    if (normalized.empty()) {
+        result.error = "invalid_repo_url";
+        return result;
+    }
+    result.identity.kind = "remote";
+    result.identity.value = normalized;
+    return result;
+}
+
 } // namespace acecode::team

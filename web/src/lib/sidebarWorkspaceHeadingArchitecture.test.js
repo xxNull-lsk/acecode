@@ -127,7 +127,8 @@ test('manual session batches survive late data and count only non-pinned rows at
   assert.doesNotMatch(toggle, /\.then\(/);
   assert.match(sidebar, /sessionListTotal=\{sessionFullyLoadedWorkspaces\.has\(ws\.hash\) \? sidebarSessionRoots\(items\)\.length : sessionListTotals\.get\(ws\.hash\)\}/);
   const controls = [...sidebar.matchAll(/<button\s+type="button"\s+onClick=\{\(\) => onToggleSessionList\?\.[\s\S]*?<\/button>/g)];
-  assert.equal(controls.length, 2);
+  // 工作区分组 + 无工作区分组 + 团队分组(add-team-workdir-sidebar)
+  assert.equal(controls.length, 3);
   for (const [control] of controls) {
     assert.match(control, /hover:text-fg/);
     assert.doesNotMatch(control, /hover:bg-|bg-accent/);

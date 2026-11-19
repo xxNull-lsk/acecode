@@ -16,6 +16,7 @@
 namespace fs = std::filesystem;
 using acecode::team::normalize_git_remote_url;
 using acecode::team::RepoIdentity;
+using acecode::team::repo_identity_from_url;
 using acecode::team::resolve_repo_identity;
 using acecode::team::team_matches_repo;
 using acecode::team::TeamMeta;
@@ -108,4 +109,29 @@ TEST(RepoIdentity, TeamMatchesRepo) {
     // local-id 与 remote 同名也不匹配
     EXPECT_FALSE(team_matches_repo(meta, RepoIdentity{"local-id", "github.com/Org/Repo"}));
     EXPECT_FALSE(team_matches_repo(meta, RepoIdentity{}));
+}
+
+// 场景: 显式远程 URL 直接得到 remote 身份,不同写法收敛到同一身份
+TEST(RepoIdentity, FromExplicitUrl) {
+    const auto https = repo_identity_from_url("https://github.com/Org/Repo.git");
+    ASSERT_TRUE(https) << https.error;
+    EXPECT_EQ(https.identity.kind, "remote");
+    EXPECT_EQ(https.identity.value, "github.com/Org/Repo");
+
+    const auto scp = repo_identity_from_url("git@github.com:Org/Repo.git");
+    ASSERT_TRUE(scp) << scp.error;
+    EXPECT_EQ(scp.identity.value, https.identity.value);
+}
+
+// 场景: 本地路径 / file:// / 缺 host/path 的 URL 拒绝为 invalid_repo_url
+TEST(RepoIdentity, FromExplicitUrlRejectsLocalForms) {
+    for (const std::string& bad : {std::string{"/home/a/repo"},
+                                   std::string{"file:///home/a/repo"},
+                                   std::string{"C:\\work\\repo"},
+                                   std::string{"https://github.com"},
+                                   std::string{""}}) {
+        const auto result = repo_identity_from_url(bad);
+        EXPECT_FALSE(result) << bad;
+        EXPECT_EQ(result.error, "invalid_repo_url") << bad;
+    }
 }

@@ -3,6 +3,7 @@
 // 团队本机存储(spec capability: team-state-sync):一个团队一个目录
 // <data_dir>/team/<team_id>/,内含:
 //   team.json          — TeamMeta(last-writer-wins 的落盘快照)
+//   local.json         — 本机团队状态(工作目录等;不随元数据同步,各设备路径不同)
 //   invite_ledger.json — 本机签发的一次性邀请码记账(15 分钟 TTL + 单次消费)
 //   sessions/<sid>/    — 会话接管时的数据副本落点
 //
@@ -37,6 +38,11 @@ struct InviteLedgerLoad {
     std::vector<InviteLedgerRecord> records;
 };
 
+// 本机团队状态:各设备本地路径不同,绝不进 TeamMeta 同步链路。
+struct TeamLocalState {
+    std::string work_dir;  // 本机团队工作目录;空 = 未设置
+};
+
 class TeamStore {
 public:
     TeamStore(std::string data_dir, std::string team_id);
@@ -45,6 +51,11 @@ public:
     // nullopt 但不抛异常(同步层靠 updated_at 较新方覆盖,旧快照可再拉)。
     bool save_meta(const TeamMeta& meta) const;
     std::optional<TeamMeta> load_meta() const;
+
+    // local.json:本机团队状态。损坏 JSON 按"未设置"处理(只影响展示与
+    // 缺省目录,不涉及凭据,无需 fail-closed);缺失文件同样返回空状态。
+    bool save_local_state(const TeamLocalState& state) const;
+    TeamLocalState load_local_state() const;
 
     // 邀请码账本:整档原子替换写;查找按 token 精确匹配。
     InviteLedgerLoad load_invites() const;
@@ -61,6 +72,7 @@ public:
 
 private:
     std::filesystem::path root_;
+    std::filesystem::path local_path_;
     std::filesystem::path invites_path_;
 };
 

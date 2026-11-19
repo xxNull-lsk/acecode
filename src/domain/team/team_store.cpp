@@ -50,6 +50,7 @@ std::string read_file(const fs::path& path) {
 
 TeamStore::TeamStore(std::string data_dir, std::string team_id)
     : root_(path_from_utf8(data_dir) / "team" / path_from_utf8(team_id)),
+      local_path_(root_ / "local.json"),
       invites_path_(root_ / "invite_ledger.json") {
 }
 
@@ -75,6 +76,34 @@ std::optional<TeamMeta> TeamStore::load_meta() const {
     }
     if (!parsed.is_object()) return std::nullopt;
     return team_meta_from_json(parsed);
+}
+
+bool TeamStore::save_local_state(const TeamLocalState& state) const {
+    std::error_code ec;
+    fs::create_directories(root_, ec);
+    if (ec) return false;
+    json j;
+    if (!state.work_dir.empty()) j["work_dir"] = state.work_dir;
+    return atomic_write_file(path_to_utf8(local_path_), j.dump());
+}
+
+TeamLocalState TeamStore::load_local_state() const {
+    TeamLocalState state;
+    std::error_code ec;
+    if (!fs::exists(local_path_, ec)) return state;
+    const std::string content = read_file(local_path_);
+    if (content.empty()) return state;
+    json parsed;
+    try {
+        parsed = json::parse(content);
+    } catch (...) {
+        return state;
+    }
+    if (!parsed.is_object()) return state;
+    const auto work_dir = parsed.find("work_dir");
+    if (work_dir != parsed.end() && work_dir->is_string())
+        state.work_dir = work_dir->get<std::string>();
+    return state;
 }
 
 InviteLedgerLoad TeamStore::load_invites() const {
