@@ -28,11 +28,16 @@ nlohmann::json team_member_public_json(const team::TeamMeta& meta,
 nlohmann::json team_session_ref_public_json(const team::TeamSessionRef& ref);
 
 // GET /api/team 与 GET /api/team/<id> 的响应:公开元数据 + 成员额度状态 +
-// 本机当日额度判定(承接能力)。
+// 本机当日额度判定(承接能力)。local 为本机团队状态(工作目录),由调用方
+// 决定是否携带(绝不随广播发给其他设备);account_status 非空时 self 以
+// 账号级共享池为准(额度属于登录账号,账号下所有团队共享),空则退回
+// 成员记录口径。
 nlohmann::json team_state_json(const team::TeamMeta& meta,
                                const std::string& self_guid,
                                const team::QuotaLedger& ledger,
-                               std::int64_t now_seconds);
+                               std::int64_t now_seconds,
+                               const team::TeamLocalState& local = {},
+                               const team::DeviceQuotaStatus* account_status = nullptr);
 
 // POST /api/team/<id>/session 请求体校验:cwd 必填。返回 error 空串 = 合法。
 std::string validate_team_session_start_body(const nlohmann::json& body);

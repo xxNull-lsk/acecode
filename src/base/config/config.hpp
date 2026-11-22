@@ -647,6 +647,19 @@ struct FeaturesConfig {
     bool completed_turn_self_heal = true;
 };
 
+struct TeamConfig {
+    // 去中心化团队协作(openspec add-decentralized-team / add-team-workdir-sidebar)。
+    // 默认关闭:关闭时 daemon 不启动团队模块(team 路由 503),主界面不出现团队
+    // 栏目;已创建/已加入的团队数据保留,重新开启后原样恢复。
+    bool enabled = false;
+    // 本机登录账号的每日 token 额度:额度属于登录账号而非设备,账号下的所有
+    // 团队共享同一个池(UTC 日重置)。0 = 当日不承接任何团队会话。
+    std::int64_t account_daily_token_quota = 30'000'000;
+};
+// 解析与稀疏保存(team_config.cpp,与 swarm/image_generation 同一模式)。
+void load_team_config_json(const nlohmann::json& j, TeamConfig& out);
+nlohmann::json team_config_to_json(const TeamConfig& cfg);
+
 struct AppConfig {
     std::string provider; // active runtime provider; empty = not configured
     OpenAiConfig openai;
@@ -678,6 +691,7 @@ struct AppConfig {
     AgentLoopConfig agent_loop;                  // agent-loop termination tunables
     NetworkConfig network;                       // proxy / TLS / abort-debug knobs
     FeaturesConfig features;                     // feature flags
+    TeamConfig team;                             // 团队协作(开关默认关;账号级每日额度)
     WebSearchConfig web_search;                  // 联网搜索工具配置(参见 add-web-search-tool)
     LspConfig lsp;                               // LSP 集成(参见 add-lsp-service)
     WorktreeConfig worktree;                     // worktree 隔离(enter_worktree / --worktree)

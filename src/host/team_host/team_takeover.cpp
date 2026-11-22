@@ -83,8 +83,10 @@ std::string align_repo_to_head(const std::string& cwd, const std::string& head_c
     return {};
 }
 
-TeamTakeover::TeamTakeover(TeamService& service, SourceDataFetcher fetch, SessionResumer resume)
-    : service_(service), fetch_(std::move(fetch)), resume_(std::move(resume)) {}
+TeamTakeover::TeamTakeover(TeamService& service, SourceDataFetcher fetch, SessionResumer resume,
+                           std::function<bool()> account_quota_exhausted)
+    : service_(service), fetch_(std::move(fetch)), resume_(std::move(resume)),
+      account_quota_exhausted_(std::move(account_quota_exhausted)) {}
 
 TakeoverOutcome TeamTakeover::take_over(const std::string& team_id,
                                         const std::string& session_id,
@@ -109,7 +111,12 @@ TakeoverOutcome TeamTakeover::take_over(const std::string& team_id,
         outcome.error = "already_host";
         return outcome;
     }
-    // 资格:本机当日额度未用尽(0 额度即不承接)。
+    // 资格:本机当日额度未用尽(0 额度即不承接)。账号级共享池优先
+    // (额度属于登录账号);未注入账号判定时退回成员记录口径。
+    if (account_quota_exhausted_ && account_quota_exhausted_()) {
+        outcome.error = "quota_exhausted";
+        return outcome;
+    }
     QuotaLedger ledger(service_.data_dir(), team_id);
     if (local_quota_status(*meta, service_.self().guid, ledger,
                            service_.now() * 1000)

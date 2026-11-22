@@ -72,6 +72,14 @@ struct DeviceQuotaStatus {
 DeviceQuotaStatus local_quota_status(const TeamMeta& meta, const std::string& guid,
                                      const QuotaLedger& ledger, std::int64_t now_ms);
 
+// 账号级状态(add-team-workdir-sidebar 反馈轮):额度属于本机登录账号而非
+// 设备,账号下的所有团队共享同一个池——额度取账号配置,已用为各团队账本
+// 当日之和。teams 传本机全部团队(由调用方 load_teams)。
+DeviceQuotaStatus account_quota_status(std::int64_t account_quota,
+                                       const std::string& data_dir,
+                                       const std::vector<TeamMeta>& teams,
+                                       std::int64_t now_ms);
+
 // 远端成员的最后已知状态:TeamMember 快照;快照不是今天的按已用 0 处理
 //(次日该设备自身额度也会归零,不误导用户)。
 DeviceQuotaStatus member_quota_snapshot(const TeamMeta& meta, const std::string& guid,

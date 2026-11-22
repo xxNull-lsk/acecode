@@ -1846,6 +1846,110 @@ void WebServer::Impl::register_ui_preferences() {
             return with_cors(req, std::move(r));
         });
 
+        // GET /api/config/team:团队协作开关与本机账号每日 token 额度。
+        CROW_ROUTE(app, "/api/config/team").methods(crow::HTTPMethod::GET)
+        ([this](const crow::request& req) {
+            if (auto rej = require_auth(req)) return std::move(*rej);
+            if (!deps.app_config) return crow::response(503);
+            std::shared_lock<std::shared_mutex> config_lock(app_config_mu);
+            crow::response r(200);
+            r.add_header("Content-Type", "application/json");
+            r.body = json{
+                {"enabled", deps.app_config->team.enabled},
+                {"account_daily_token_quota", deps.app_config->team.account_daily_token_quota},
+            }.dump();
+            return with_cors(req, std::move(r));
+        });
+
+        // PUT /api/config/team body {enabled?, account_daily_token_quota?}。
+        // 开关即时生效:开启拉起团队模块,关闭断开连接、退订并停用(数据保留);
+        // 额度属于登录账号,变更后同步进各团队自己的成员记录供其他设备展示。
+        CROW_ROUTE(app, "/api/config/team").methods(crow::HTTPMethod::PUT)
+        ([this](const crow::request& req) {
+            if (auto rej = require_auth(req)) return std::move(*rej);
+            if (!deps.app_config) return crow::response(503);
+
+            const auto json_err = [&](int status, const char* code, const std::string& msg) {
+                crow::response r(status);
+                r.body = json{{"error", code}, {"message", msg}}.dump();
+                r.add_header("Content-Type", "application/json");
+                return with_cors(req, std::move(r));
+            };
+
+            json body;
+            try { body = json::parse(req.body); }
+            catch (const std::exception& e) {
+                return json_err(400, "BAD_JSON",
+                                std::string("invalid JSON body: ") + e.what());
+            }
+            if (!body.is_object() ||
+                !(body.contains("enabled") || body.contains("account_daily_token_quota")) ||
+                (body.contains("enabled") && !body["enabled"].is_boolean()) ||
+                (body.contains("account_daily_token_quota") &&
+                 !body["account_daily_token_quota"].is_number_integer())) {
+                return json_err(400, "BAD_REQUEST",
+                                "expected {enabled?: boolean, account_daily_token_quota?: integer}");
+            }
+            const bool has_enabled = body.contains("enabled");
+            const bool has_quota = body.contains("account_daily_token_quota");
+            const bool enabled_value = has_enabled ? body["enabled"].get<bool>() : false;
+            const std::int64_t quota_value = has_quota
+                ? body["account_daily_token_quota"].get<std::int64_t>() : 0;
+
+            bool persisted_enabled = false;
+            bool persisted_quota = false;
+            {
+                std::lock_guard<std::shared_mutex> config_lock(app_config_mu);
+                SettingsMutationOptions options;
+                options.config_path = deps.config_path;
+                options.live_config = deps.app_config;
+                if (has_enabled) {
+                    const auto result = set_team_enabled(enabled_value, options);
+                    if (!result.ok) return json_err(500, "PERSIST_FAILED", result.error);
+                    persisted_enabled = deps.app_config->team.enabled;
+                }
+                if (has_quota) {
+                    const auto result = set_team_account_quota(quota_value, options);
+                    if (!result.ok) {
+                        const int status = result.error_code == "invalid_quota" ? 400 : 500;
+                        return json_err(status, result.error_code.c_str(), result.error);
+                    }
+                    persisted_quota = true;
+                }
+            }
+
+            // 即时生效(不持配置锁:广播/启停路径内部会取配置共享锁,同线程
+            // 再取会自锁)。模块启停与团队生命周期互斥,避免与停用路径并发。
+            if (has_enabled) {
+                std::lock_guard<std::mutex> lifecycle_lock(team_lifecycle_mu);
+                if (enabled_value) {
+                    initialize_team();
+                } else if (team_service) {
+                    stop_team();
+                    team_service.reset();
+                }
+            }
+            // 额度是账号级:变更后写进各团队自己的成员记录,其他设备看到的
+            // 每日额度随之更新。
+            if (persisted_quota && team_service) {
+                for (const auto& meta : team_service->load_teams()) {
+                    (void)team_service->set_daily_quota(meta.team_id,
+                                                        team_service->self().guid,
+                                                        quota_value);
+                    broadcast_team_state(meta.team_id);
+                }
+            }
+
+            crow::response r(200);
+            r.add_header("Content-Type", "application/json");
+            std::shared_lock<std::shared_mutex> config_lock(app_config_mu);
+            r.body = json{
+                {"enabled", deps.app_config->team.enabled},
+                {"account_daily_token_quota", deps.app_config->team.account_daily_token_quota},
+            }.dump();
+            return with_cors(req, std::move(r));
+        });
+
         // PUT /api/config/remote-web body {enabled:boolean}. The daemon's Crow
         // listener stays on loopback; only the supervised proxy child changes.
         CROW_ROUTE(app, "/api/config/remote-web").methods(crow::HTTPMethod::PUT)

@@ -407,6 +407,11 @@ export function createApi(base = null) {
     sendTeamSessionMessage: (teamId, sessionId, text) =>
       request('POST', `/api/team/${encodeURIComponent(teamId)}/session/${encodeURIComponent(sessionId)}/message`,
         { text }, base, { timeoutMs: 30000 }),
+    setTeamWorkdir: (teamId, cwd) =>
+      request('POST', `/api/team/${encodeURIComponent(teamId)}/workdir`, { cwd }, base),
+    // 团队功能开关与账号级每日额度(第一级设置;关闭时 daemon 停用团队模块)。
+    getTeamConfig: () => request('GET', '/api/config/team', undefined, base),
+    setTeamConfig: (patch) => request('PUT', '/api/config/team', patch, base),
     teamSocket: (teamId) => {
       const url = new URL(fullUrl(`/ws/team/${encodeURIComponent(teamId)}`, base), window.location.href);
       url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';

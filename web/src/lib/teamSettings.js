@@ -1,7 +1,39 @@
 // 团队设置页的纯逻辑(可单测,openspec add-decentralized-team tasks 6.2/6.3)。
 // 组件层只做渲染,状态合并 / 事件处理 / 展示格式都收敛在这里。
 
+import { ApiError } from './api.js';
 import { DEFAULT_DAILY_TOKEN_QUOTA } from './teamConstants.js';
+
+// ApiError code → 中文文案(创建/加入弹框与设置页共用)。
+export function teamErrorText(e) {
+  if (e instanceof ApiError) {
+    const code = e.body?.error || '';
+    const mapped = {
+      not_admin: '仅管理员可执行该操作',
+      invite_invalid: '邀请码无效或已过期',
+      team_full: '团队成员已满(50 人)',
+      repo_not_linked: '当前项目未关联到该团队',
+      too_many_concurrent_sessions: '团队并发会话已达上限(5)',
+      quota_exhausted: '目标设备当日额度已用尽',
+      member_offline: '目标设备不在线',
+      session_not_running: '会话未在运行',
+      not_host: '会话不在该设备上',
+      team_id_mismatch: '对端返回的团队不一致',
+      self_not_in_team: '快照中没有本机身份',
+      connection_failed: '连接失败,请检查网络',
+      no_lan_address: '未发现可用的局域网地址',
+      no_daemon_port: 'daemon 端口未知',
+      invalid_name: '请填写团队名称',
+      invalid_cwd: '请填写工作目录',
+      invalid_link: '请粘贴有效的邀请链接',
+      invalid_repo_url: '仓库 URL 无效:请填写可跨设备复用的远程仓库地址',
+      workdir_not_git_repo: '工作目录不是 git 仓库,请填写远程仓库 URL',
+      repo_mismatch: '工作目录与团队仓库不匹配:请检出团队仓库后重试',
+    };
+    return mapped[code] || e.message || '请求失败,请重试';
+  }
+  return e?.message || '请求失败,请重试';
+}
 
 // WS 消息解析:返回 { type, ... } 对象;非法消息返回 null。
 export function parseTeamSocketMessage(data) {

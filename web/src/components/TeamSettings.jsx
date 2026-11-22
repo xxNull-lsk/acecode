@@ -1,8 +1,9 @@
-// 团队(设置 > 集成 > 团队,openspec add-decentralized-team tasks 6.2/6.3)。
-// 管理页:创建团队、一次性邀请码(带剩余时间)、成员列表 + 角色管理、
-// 每日额度即时保存(无保存按钮);会话列表:发起、结束、手动接管、队员消息
-// 入口、暂停/切换事件通知。状态经 /ws/team/<id> 实时合并,纯逻辑在
-// lib/teamSettings.js。
+// 团队设置(设置 > 集成 > 团队,add-team-workdir-sidebar 反馈轮两级导航)。
+// 第一级(root):功能开关(默认关,即时生效)、本机账号每日 token 额度、
+//   团队列表(点行进入第二级)与创建/加入入口。
+// 第二级(detail):单个团队——基本信息(工作区位置/仓库)、邀请码、成员
+//   与角色、团队会话列表(发起/接管/消息)。状态经 /ws/team/<id> 实时合并,
+//   纯逻辑在 lib/teamSettings.js。
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../lib/api.js';
 import { clsx } from '../lib/format.js';
@@ -19,46 +20,19 @@ import {
   sessionStateView,
   streamEventText,
   takeoverTargetError,
+  teamErrorText as errText,
   toggleStreamExpanded,
   visibleStreamLines,
 } from '../lib/teamSettings.js';
-import { DEFAULT_DAILY_TOKEN_QUOTA } from '../lib/teamConstants.js';
-import { Modal } from './Modal.jsx';
+import { pickWorkspaceFolder } from '../lib/workspaceFolderPicker.js';
+import { Modal, Toggle } from './Modal.jsx';
 import { VsIcon } from './Icon.jsx';
 import { toast } from './Toast.jsx';
 
 const NOW_MS_INTERVAL = 1000;
 const QUOTA_MILLION = 1_000_000;
 
-function errText(e) {
-  if (e instanceof ApiError) {
-    const code = e.body?.error || '';
-    const mapped = {
-      not_admin: '仅管理员可执行该操作',
-      invite_invalid: '邀请码无效或已过期',
-      team_full: '团队成员已满(50 人)',
-      repo_not_linked: '当前项目未关联到该团队',
-      too_many_concurrent_sessions: '团队并发会话已达上限(5)',
-      quota_exhausted: '目标设备当日额度已用尽',
-      member_offline: '目标设备不在线',
-      session_not_running: '会话未在运行',
-      not_host: '会话不在该设备上',
-      team_id_mismatch: '对端返回的团队不一致',
-      self_not_in_team: '快照中没有本机身份',
-      connection_failed: '连接失败,请检查网络',
-      no_lan_address: '未发现可用的局域网地址',
-      no_daemon_port: 'daemon 端口未知',
-      invalid_name: '请填写团队名称',
-      invalid_cwd: '请填写工作目录',
-      invalid_link: '请粘贴有效的邀请链接',
-      invalid_repo_url: '仓库 URL 无效:请填写可跨设备复用的远程仓库地址',
-      workdir_not_git_repo: '工作目录不是 git 仓库,请填写远程仓库 URL',
-      repo_mismatch: '工作目录与团队仓库不匹配:请检出团队仓库后重试',
-    };
-    return mapped[code] || e.message || '请求失败,请重试';
-  }
-  return e?.message || '请求失败,请重试';
-}
+// 设置页二级/一级共用:状态圆点。
 
 // 状态圆点。
 function Dot({ tone = 'ok', label }) {
@@ -74,17 +48,13 @@ function Dot({ tone = 'ok', label }) {
   );
 }
 
-export function TeamSettings() {
+function TeamSettingsDetail({ teamId, onBack }) {
   const [state, setState] = useState(initialTeamSettingsState);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState('');
   const busyRef = useRef('');
-  // 创建/加入弹框表单(add-team-workdir-sidebar):null = 关闭。
-  const [createModal, setCreateModal] = useState(null); // { name, cwd, repoUrl, error, busy }
-  const [joinModal, setJoinModal] = useState(null); // { link, cwd, error, busy }
   const [invite, setInvite] = useState(null); // { link, expires_at, team_id }
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
-  const [quotaDraft, setQuotaDraft] = useState(null); // 字符串输入草稿(仅自己)
   const [takeoverTarget, setTakeoverTarget] = useState(null); // { teamId, sessionId }
   const [notice, setNotice] = useState(null); // { text, tone }
   const wsRef = useRef(null);
@@ -129,7 +99,11 @@ export function TeamSettings() {
     }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  // 二级视图锁定在该团队:进入时定位,加载失败提示返回。
+  useEffect(() => {
+    setState((prev) => ({ ...prev, activeTeamId: teamId }));
+    load();
+  }, [load, teamId]);
 
   useEffect(() => {
     const timer = setInterval(() => setNowSeconds(Math.floor(Date.now() / 1000)), NOW_MS_INTERVAL);
@@ -189,26 +163,6 @@ export function TeamSettings() {
   // 会话事件的提示(暂停原因 / host 切换)在 WS onmessage 回调里发。
   // 这里不重复监听 connection 全局事件:团队状态走专用 /ws/team 连接。
 
-  // 创建团队:名称 + 工作目录(是 git 仓库时可省略仓库 URL,否则必填,
-  // 以后端校验为准)。成功后切到新团队。
-  const submitCreate = async () => {
-    const form = createModal;
-    if (!form || form.busy) return;
-    const name = form.name.trim();
-    const cwd = form.cwd.trim();
-    if (!name) { setCreateModal({ ...form, error: '请填写团队名称' }); return; }
-    if (!cwd) { setCreateModal({ ...form, error: '请填写工作目录' }); return; }
-    setCreateModal({ ...form, busy: true, error: '' });
-    const meta = await run('create', () => api.createTeam(name, { cwd, repoUrl: form.repoUrl.trim() }),
-      { onError: (message) => setCreateModal((prev) => (prev ? { ...prev, busy: false, error: message } : prev)) });
-    if (!meta) return;
-    setCreateModal(null);
-    await load();
-    window.dispatchEvent(new CustomEvent('acecode:teams-changed'));
-    setState((prev) => ({ ...prev, activeTeamId: meta.team_id }));
-    toast({ kind: 'ok', text: '团队已创建' });
-  };
-
   const issueInvite = () => {
     if (!activeTeam) return;
     run('invite', async () => {
@@ -217,25 +171,6 @@ export function TeamSettings() {
       toast({ kind: 'ok', text: '邀请码已生成,15 分钟内有效且只能使用一次' });
       return result;
     });
-  };
-
-  // 加入团队:邀请链接 + 本机工作目录。git 仓库从团队信息自动匹配,
-  // 不匹配(目录未检出团队仓库)时后端拒绝并提示原因。
-  const submitJoin = async () => {
-    const form = joinModal;
-    if (!form || form.busy) return;
-    const link = form.link.trim();
-    const cwd = form.cwd.trim();
-    if (!link) { setJoinModal({ ...form, error: '请粘贴邀请链接' }); return; }
-    if (!cwd) { setJoinModal({ ...form, error: '请填写工作目录' }); return; }
-    setJoinModal({ ...form, busy: true, error: '' });
-    const ok = await run('join', () => api.joinTeam(link, cwd),
-      { onError: (message) => setJoinModal((prev) => (prev ? { ...prev, busy: false, error: message } : prev)) });
-    if (!ok) return;
-    setJoinModal(null);
-    await load();
-    window.dispatchEvent(new CustomEvent('acecode:teams-changed'));
-    toast({ kind: 'ok', text: '已加入团队' });
   };
 
   const copyInvite = async () => {
@@ -253,21 +188,6 @@ export function TeamSettings() {
     run(`role-${member.guid}`, async () => {
       await api.setTeamRole(activeTeam.team_id, member.guid, role);
       toast({ kind: 'ok', text: `${memberDisplayName(member)} 已设为${memberRoleLabel({ role })}` });
-    });
-  };
-
-  const saveQuota = () => {
-    if (!activeTeam || quotaDraft == null) return;
-    const value = Math.floor(Number(quotaDraft) * QUOTA_MILLION);
-    if (!Number.isFinite(value) || value < 0) {
-      toast({ kind: 'err', text: '额度无效:请输入不小于 0 的百万 tokens 数,0 表示当日不承接' });
-      setQuotaDraft(null);
-      return;
-    }
-    setQuotaDraft(null);
-    run('quota', async () => {
-      await api.setTeamQuota(activeTeam.team_id, value);
-      toast({ kind: 'ok', text: '每日额度已保存' });
     });
   };
 
@@ -321,6 +241,24 @@ export function TeamSettings() {
     });
   };
 
+  // 工作区位置:目录选择器(原生/网页)→ 保存本机团队工作目录;与团队已
+  // 登记仓库匹配时 daemon 侧自动补登记。
+  const changeWorkdir = async () => {
+    if (busy === 'workdir' || !activeTeam) return;
+    setBusy('workdir');
+    try {
+      const picked = await pickWorkspaceFolder({ api });
+      if (!picked) return;
+      await api.setTeamWorkdir(activeTeam.team_id, picked);
+      await load();
+      toast({ kind: 'ok', text: '工作区位置已更新' });
+    } catch (e) {
+      toast({ kind: 'err', text: errText(e) });
+    } finally {
+      setBusy('');
+    }
+  };
+
   const self = activeTeam?.members?.find((member) => member.guid === activeTeam.self?.guid);
   const isAdmin = self?.role === 'admin';
 
@@ -339,47 +277,62 @@ export function TeamSettings() {
       )}
 
       {!loading && !activeTeam && (
-        <div className="max-w-md">
-          <div className="flex items-center gap-2 px-3.5 py-2.5 rounded-md bg-surface border border-border mb-2">
-            <button
-              type="button"
-              disabled={busy === 'create'}
-              onClick={() => setCreateModal({ name: '', cwd: '', repoUrl: '', error: '', busy: false })}
-              className="px-3 py-1 bg-accent text-white rounded disabled:opacity-60"
-            >创建团队</button>
-            <button
-              type="button"
-              disabled={busy === 'join'}
-              onClick={() => setJoinModal({ link: '', cwd: '', error: '', busy: false })}
-              className="px-3 py-1 rounded border border-border text-[13px] text-fg hover:bg-surface-hi transition disabled:opacity-60"
-            >加入团队</button>
-          </div>
+        <div className="px-3.5 py-2.5 rounded-md bg-surface border border-border mb-2 text-[13px] text-fg-mute max-w-md">
+          未找到该团队,可能已被移除。
         </div>
       )}
 
       {activeTeam && (
         <>
           <div className="flex items-center justify-between mb-3">
-            <div className="flex items-center gap-2 text-[14px] text-fg">
-              {activeTeam.name || '团队'}
-              {state.teams.length > 1 && (
-                <select
-                  value={state.activeTeamId}
-                  onChange={(e) => setState((prev) => ({ ...prev, activeTeamId: e.target.value }))}
-                  aria-label="切换团队"
-                  className="h-7 px-2 text-[12px] rounded-md border border-border bg-surface-alt text-fg outline-none focus:border-accent transition"
-                >
-                  {state.teams.map((team) => (
-                    <option key={team.team_id} value={team.team_id}>{team.name || team.team_id}</option>
-                  ))}
-                </select>
-              )}
+            <div className="flex items-center gap-2 text-[14px] text-fg min-w-0">
+              <button
+                type="button"
+                onClick={onBack}
+                className="w-7 h-7 rounded-md flex items-center justify-center text-fg-mute hover:text-fg hover:bg-surface-hi shrink-0"
+                title="返回团队列表"
+                aria-label="返回团队列表"
+              >
+                <VsIcon name="back" size={18} />
+              </button>
+              <span className="min-w-0 truncate">{activeTeam.name || '团队'}</span>
             </div>
             <Dot
               tone={state.wsStatus === 'open' ? 'ok' : 'warn'}
               label={state.wsStatus === 'open' ? '已连接' : '连接中…'}
             />
           </div>
+
+          {/* 基本信息:工作区位置(可改) + 团队仓库 */}
+          <div className="text-[14px] font-semibold mt-1 mb-2">基本信息</div>
+          <div className="flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-md bg-surface border border-border mb-2">
+            <div className="text-[13px] text-fg shrink-0">工作区位置</div>
+            <div className="flex items-center gap-2 min-w-0">
+              <div
+                className="text-[12px] text-fg-mute truncate max-w-[20rem]"
+                title={activeTeam.local?.work_dir || ''}
+              >
+                {activeTeam.local?.work_dir || '未设置'}
+              </div>
+              <button
+                type="button"
+                disabled={busy === 'workdir'}
+                onClick={changeWorkdir}
+                className="px-2 py-0.5 text-[11px] text-fg-mute hover:text-fg hover:underline shrink-0 disabled:opacity-50"
+              >选择目录</button>
+            </div>
+          </div>
+          {(activeTeam.repos || []).length > 0 && (
+            <div className="flex items-center justify-between px-3.5 py-2.5 rounded-md bg-surface border border-border mb-2">
+              <div className="text-[13px] text-fg shrink-0">团队仓库</div>
+              <div
+                className="text-[12px] text-fg-mute truncate max-w-[24rem]"
+                title={(activeTeam.repos || []).map((r) => r.value).join(' · ')}
+              >
+                {(activeTeam.repos || []).map((r) => r.value).join(' · ')}
+              </div>
+            </div>
+          )}
 
           {notice && (
             <div className={clsx('mb-3 px-3 py-2 rounded-md border bg-surface text-[12px] flex items-center justify-between gap-3',
@@ -438,16 +391,7 @@ export function TeamSettings() {
                 <div className="flex items-center gap-2 shrink-0">
                   <Dot tone={online ? 'ok' : 'mute'} label={online ? '在线' : '离线'} />
                   {isSelf ? (
-                    <input
-                      type="number"
-                      min="0"
-                      value={quotaDraft ?? (member.daily_token_quota ?? DEFAULT_DAILY_TOKEN_QUOTA) / QUOTA_MILLION}
-                      onChange={(e) => setQuotaDraft(e.target.value)}
-                      onBlur={saveQuota}
-                      onKeyDown={(e) => { if (e.key === 'Enter') saveQuota(); }}
-                      aria-label="本机每日额度(百万 tokens)"
-                      className="w-20 h-7 px-2 text-[12px] text-center rounded-md border border-border bg-surface-alt text-fg outline-none focus:border-accent transition"
-                    />
+                    <span className="text-[11px] text-fg-mute">额度在团队设置第一级配置</span>
                   ) : isAdmin && (
                     <button
                       type="button"
@@ -546,15 +490,6 @@ export function TeamSettings() {
             onClick={startSession}
             className="mt-1 px-3 py-1 bg-accent text-white rounded disabled:opacity-60"
           >发起团队会话</button>
-
-          <div className="h-px bg-border my-5" />
-          <div className="text-[12px] text-fg-mute">加入其他团队:</div>
-          <button
-            type="button"
-            disabled={busy === 'join'}
-            onClick={() => setJoinModal({ link: '', cwd: '', error: '', busy: false })}
-            className="mt-2 px-3 py-1 rounded border border-border text-[13px] text-fg hover:bg-surface-hi transition disabled:opacity-60"
-          >粘贴邀请链接加入</button>
         </>
       )}
 
@@ -585,158 +520,231 @@ export function TeamSettings() {
           </div>
         </Modal>
       )}
+    </div>
+  );
+}
 
-      {/* 创建团队:名称 + 工作目录(是 git 仓库时可省略仓库 URL) */}
-      {createModal && (
-        <Modal onClose={() => setCreateModal(null)} width={520} dismissOnBackdrop={false} labelledBy="team-create-title">
-          {({ close }) => (
-            <form
-              onSubmit={(event) => { event.preventDefault(); submitCreate(); }}
-              className="ace-modal-form"
-            >
-              <div className="shrink-0 px-5 py-4 border-b border-border flex items-start gap-3">
-                <div className="w-9 h-9 rounded-lg bg-accent/10 text-accent flex items-center justify-center shrink-0">
-                  <VsIcon name="antenna" size={19} />
+// ── 第一级:团队功能整体设置 ─────────────────────────────────────────
+export function TeamSettings() {
+  const [view, setView] = useState('root'); // root = 整体设置;detail = 单个团队
+  const [detailTeamId, setDetailTeamId] = useState('');
+
+  // 侧边栏「团队设置」入口:直接进入该团队的二级设置。
+  useEffect(() => {
+    const handler = (event) => {
+      const teamId = event.detail?.teamId;
+      if (!teamId) return;
+      setDetailTeamId(teamId);
+      setView('detail');
+    };
+    window.addEventListener('acecode:open-team-settings', handler);
+    return () => window.removeEventListener('acecode:open-team-settings', handler);
+  }, []);
+
+  if (view === 'detail') {
+    return (
+      <TeamSettingsDetail
+        teamId={detailTeamId}
+        onBack={() => setView('root')}
+      />
+    );
+  }
+  return <TeamSettingsRoot onOpenTeam={(teamId) => { setDetailTeamId(teamId); setView('detail'); }} />;
+}
+
+function TeamSettingsRoot({ onOpenTeam }) {
+  const [config, setConfig] = useState(null); // { enabled, account_daily_token_quota }
+  const [configLoading, setConfigLoading] = useState(true);
+  const [teams, setTeams] = useState([]);
+  const [teamsLoading, setTeamsLoading] = useState(true);
+  const [saving, setSaving] = useState(''); // 'enabled' | 'quota'
+  const [quotaDraft, setQuotaDraft] = useState(null); // 百万 tokens 字符串草稿
+  const [createOpen, setCreateOpen] = useState(false);
+  const [joinOpen, setJoinOpen] = useState(false);
+  const enabled = config?.enabled === true;
+
+  const load = useCallback(async () => {
+    try {
+      const result = await api.getTeamConfig();
+      setConfig({
+        enabled: result?.enabled === true,
+        account_daily_token_quota: Number(result?.account_daily_token_quota ?? 0),
+      });
+    } catch (e) {
+      toast({ kind: 'err', text: errText(e) });
+    } finally {
+      setConfigLoading(false);
+    }
+    try {
+      const result = await api.listTeams();
+      setTeams(Array.isArray(result?.teams) ? result.teams : []);
+    } catch { /* 功能未开或暂不可用:列表为空 */ }
+    finally {
+      setTeamsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    window.addEventListener('acecode:teams-changed', load);
+    window.addEventListener('acecode:team-config-changed', load);
+    return () => {
+      window.removeEventListener('acecode:teams-changed', load);
+      window.removeEventListener('acecode:team-config-changed', load);
+    };
+  }, [load]);
+
+  const notifyTeamConfigChanged = () => {
+    window.dispatchEvent(new CustomEvent('acecode:teams-changed'));
+    window.dispatchEvent(new CustomEvent('acecode:team-config-changed'));
+  };
+
+  // 开关:变更立即持久化并即时启停 daemon 团队模块;失败回滚。
+  const switchEnabled = async (next) => {
+    if (saving) return;
+    const previous = config;
+    setConfig((prev) => ({ ...prev, enabled: next }));
+    setSaving('enabled');
+    try {
+      const result = await api.setTeamConfig({ enabled: next });
+      setConfig({
+        enabled: result?.enabled === true,
+        account_daily_token_quota: Number(result?.account_daily_token_quota ?? previous?.account_daily_token_quota ?? 0),
+      });
+      notifyTeamConfigChanged();
+    } catch (e) {
+      setConfig(previous);
+      toast({ kind: 'err', text: errText(e) });
+    } finally {
+      setSaving('');
+    }
+  };
+
+  // 账号每日额度:失焦 / Enter 提交(百万 tokens);失败保留草稿可重试。
+  const saveQuota = async () => {
+    if (saving || quotaDraft == null) return;
+    const value = Math.floor(Number(quotaDraft) * QUOTA_MILLION);
+    if (!Number.isFinite(value) || value < 0) {
+      toast({ kind: 'err', text: '额度无效:请输入不小于 0 的百万 tokens 数,0 表示当日不承接' });
+      return;
+    }
+    setSaving('quota');
+    try {
+      const result = await api.setTeamConfig({ account_daily_token_quota: value });
+      setConfig((prev) => ({
+        ...prev,
+        account_daily_token_quota: Number(result?.account_daily_token_quota ?? value),
+      }));
+      setQuotaDraft(null);
+      notifyTeamConfigChanged();
+    } catch (e) {
+      toast({ kind: 'err', text: errText(e) }); // 草稿保留,可直接重试
+    } finally {
+      setSaving('');
+    }
+  };
+
+  const afterCreated = async (meta) => {
+    notifyTeamConfigChanged();
+    onOpenTeam(meta.team_id);
+  };
+
+  return (
+    <div className="flex-1 overflow-y-auto px-12 py-6">
+      <h2 className="text-xl font-bold mb-5">团队</h2>
+
+      {configLoading ? (
+        <div className="text-[13px] text-fg-mute">加载中…</div>
+      ) : (
+        <div className="max-w-xl">
+          {/* 1. 功能开关:关闭时 daemon 停用团队模块,主界面不出现团队栏目 */}
+          <div className="flex items-center justify-between px-3.5 py-2.5 rounded-md bg-surface border border-border mb-2">
+            <div className="text-[13px] text-fg">开启团队功能</div>
+            <Toggle
+              on={enabled}
+              disabled={saving === 'enabled'}
+              onChange={(value) => switchEnabled(value)}
+              ariaLabel="开启团队功能"
+            />
+          </div>
+
+          {enabled && (
+            <>
+              {/* 2. 本机账号的每日 token 额度:账号下所有团队共享同一个池 */}
+              <div className="flex items-center justify-between px-3.5 py-2.5 rounded-md bg-surface border border-border mb-2">
+                <div>
+                  <div className="text-[13px] text-fg">每日 token 额度</div>
+                  <div className="text-[11px] text-fg-mute mt-0.5">本机账号所有团队共享,UTC 日重置</div>
                 </div>
-                <div className="min-w-0">
-                  <h2 id="team-create-title" className="text-[15px] font-semibold text-fg">创建团队</h2>
-                  <p className="mt-0.5 text-[12px] leading-5 text-fg-mute">
-                    团队围绕一个工作目录与 git 仓库协作。
-                  </p>
-                </div>
+                <input
+                  type="number"
+                  min="0"
+                  value={quotaDraft ?? (config.account_daily_token_quota ?? 0) / QUOTA_MILLION}
+                  onChange={(e) => setQuotaDraft(e.target.value)}
+                  onBlur={saveQuota}
+                  onKeyDown={(e) => { if (e.key === 'Enter') saveQuota(); }}
+                  aria-label="每日 token 额度(百万 tokens)"
+                  disabled={saving === 'quota'}
+                  className="w-24 h-7 px-2 text-[12px] text-center rounded-md border border-border bg-surface-alt text-fg outline-none focus:border-accent transition"
+                />
               </div>
-              <div className="min-h-0 overflow-y-auto ace-scrollbar px-5 py-4 space-y-4">
-                <label className="block">
-                  <span className="block mb-1.5 text-[12px] font-medium text-fg">团队名称</span>
-                  <input
-                    value={createModal.name}
-                    onChange={(e) => setCreateModal((prev) => ({ ...prev, name: e.target.value, error: '' }))}
-                    maxLength={128}
-                    autoComplete="off"
-                    spellCheck={false}
-                    className="w-full h-9 px-3 rounded-lg border border-border bg-bg text-[13px] text-fg outline-none focus:border-accent focus:ring-1 focus:ring-accent"
-                  />
-                </label>
-                <label className="block">
-                  <span className="block mb-1.5 text-[12px] font-medium text-fg">工作目录</span>
-                  <input
-                    value={createModal.cwd}
-                    onChange={(e) => setCreateModal((prev) => ({ ...prev, cwd: e.target.value, error: '' }))}
-                    autoComplete="off"
-                    spellCheck={false}
-                    placeholder="/home/user/project"
-                    className="w-full h-9 px-3 rounded-lg border border-border bg-bg text-[13px] font-mono text-fg outline-none focus:border-accent focus:ring-1 focus:ring-accent placeholder:text-fg-mute/60"
-                  />
-                </label>
-                <label className="block">
-                  <span className="block mb-1.5 text-[12px] font-medium text-fg">git 仓库 URL(选填)</span>
-                  <input
-                    value={createModal.repoUrl}
-                    onChange={(e) => setCreateModal((prev) => ({ ...prev, repoUrl: e.target.value, error: '' }))}
-                    autoComplete="off"
-                    spellCheck={false}
-                    placeholder="https://github.com/org/repo.git"
-                    className="w-full h-9 px-3 rounded-lg border border-border bg-bg text-[13px] font-mono text-fg outline-none focus:border-accent focus:ring-1 focus:ring-accent placeholder:text-fg-mute/60"
-                  />
-                  <span className="block mt-1.5 text-[11px] leading-5 text-fg-mute">
-                    工作目录是 git 仓库时自动从目录解析;不是 git 仓库时必填。
-                  </span>
-                </label>
-                {createModal.error && (
-                  <div role="alert" className="px-3 py-2 rounded-lg border border-danger/30 bg-surface text-[12px] leading-5 text-danger">
-                    {createModal.error}
+
+              {/* 3. 团队列表:点行进入该团队的二级设置 */}
+              <div className="text-[14px] font-semibold mt-4 mb-2">团队列表</div>
+              {teamsLoading && <div className="text-[13px] text-fg-mute mb-2">加载中…</div>}
+              {!teamsLoading && teams.length === 0 && (
+                <div className="px-3.5 py-2.5 rounded-md bg-surface border border-border mb-2 text-[13px] text-fg-mute">
+                  还没有团队。
+                </div>
+              )}
+              {teams.map((team) => (
+                <div
+                  key={team.team_id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => onOpenTeam(team.team_id)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      onOpenTeam(team.team_id);
+                    }
+                  }}
+                  className="flex items-center justify-between px-3.5 py-2.5 rounded-md bg-surface border border-border mb-2 cursor-pointer hover:bg-surface-hi transition"
+                >
+                  <div className="min-w-0">
+                    <div className="text-[13px] text-fg truncate">{team.name || team.team_id}</div>
+                    <div className="text-[11px] text-fg-mute mt-0.5">
+                      {(team.members || []).length} 名成员 · {(team.sessions || []).length} 个团队会话
+                    </div>
                   </div>
-                )}
-              </div>
-              <div className="shrink-0 px-5 py-3 border-t border-border bg-surface-alt flex items-center justify-end gap-2">
+                  <VsIcon name="expandRight" size={16} className="text-fg-mute shrink-0" />
+                </div>
+              ))}
+
+              <div className="flex items-center gap-2 mt-3">
                 <button
                   type="button"
-                  onClick={close}
-                  className="h-8 px-3 rounded-lg text-[12px] text-fg hover:bg-surface-hi"
-                >取消</button>
+                  onClick={() => setCreateOpen(true)}
+                  className="px-3 py-1 bg-accent text-white rounded"
+                >创建团队</button>
                 <button
-                  type="submit"
-                  data-ace-dialog-primary="true"
-                  disabled={createModal.busy}
-                  className="h-8 min-w-[82px] px-3 rounded-lg bg-accent text-white text-[12px] font-medium hover:brightness-110 disabled:opacity-50 flex items-center justify-center gap-1.5"
-                >
-                  {createModal.busy && <span className="ace-spinner w-3 h-3" />}
-                  {createModal.busy ? '创建中…' : '创建团队'}
-                </button>
+                  type="button"
+                  onClick={() => setJoinOpen(true)}
+                  className="px-3 py-1 rounded border border-border text-[13px] text-fg hover:bg-surface-hi transition"
+                >加入团队</button>
               </div>
-            </form>
+            </>
           )}
-        </Modal>
+        </div>
       )}
 
-      {/* 加入团队:邀请链接 + 工作目录;git 仓库从团队信息自动匹配 */}
-      {joinModal && (
-        <Modal onClose={() => setJoinModal(null)} width={520} dismissOnBackdrop={false} labelledBy="team-join-title">
-          {({ close }) => (
-            <form
-              onSubmit={(event) => { event.preventDefault(); submitJoin(); }}
-              className="ace-modal-form"
-            >
-              <div className="shrink-0 px-5 py-4 border-b border-border flex items-start gap-3">
-                <div className="w-9 h-9 rounded-lg bg-accent/10 text-accent flex items-center justify-center shrink-0">
-                  <VsIcon name="antenna" size={19} />
-                </div>
-                <div className="min-w-0">
-                  <h2 id="team-join-title" className="text-[15px] font-semibold text-fg">加入团队</h2>
-                  <p className="mt-0.5 text-[12px] leading-5 text-fg-mute">
-                    git 仓库从团队信息自动匹配,需先在本机检出团队仓库。
-                  </p>
-                </div>
-              </div>
-              <div className="min-h-0 overflow-y-auto ace-scrollbar px-5 py-4 space-y-4">
-                <label className="block">
-                  <span className="block mb-1.5 text-[12px] font-medium text-fg">邀请链接</span>
-                  <input
-                    value={joinModal.link}
-                    onChange={(e) => setJoinModal((prev) => ({ ...prev, link: e.target.value, error: '' }))}
-                    autoComplete="off"
-                    spellCheck={false}
-                    placeholder="acecode://team/…"
-                    className="w-full h-9 px-3 rounded-lg border border-border bg-bg text-[13px] font-mono text-fg outline-none focus:border-accent focus:ring-1 focus:ring-accent placeholder:text-fg-mute/60"
-                  />
-                </label>
-                <label className="block">
-                  <span className="block mb-1.5 text-[12px] font-medium text-fg">工作目录</span>
-                  <input
-                    value={joinModal.cwd}
-                    onChange={(e) => setJoinModal((prev) => ({ ...prev, cwd: e.target.value, error: '' }))}
-                    autoComplete="off"
-                    spellCheck={false}
-                    placeholder="/home/user/project"
-                    className="w-full h-9 px-3 rounded-lg border border-border bg-bg text-[13px] font-mono text-fg outline-none focus:border-accent focus:ring-1 focus:ring-accent placeholder:text-fg-mute/60"
-                  />
-                </label>
-                {joinModal.error && (
-                  <div role="alert" className="px-3 py-2 rounded-lg border border-danger/30 bg-surface text-[12px] leading-5 text-danger">
-                    {joinModal.error}
-                  </div>
-                )}
-              </div>
-              <div className="shrink-0 px-5 py-3 border-t border-border bg-surface-alt flex items-center justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={close}
-                  className="h-8 px-3 rounded-lg text-[12px] text-fg hover:bg-surface-hi"
-                >取消</button>
-                <button
-                  type="submit"
-                  data-ace-dialog-primary="true"
-                  disabled={joinModal.busy}
-                  className="h-8 min-w-[82px] px-3 rounded-lg bg-accent text-white text-[12px] font-medium hover:brightness-110 disabled:opacity-50 flex items-center justify-center gap-1.5"
-                >
-                  {joinModal.busy && <span className="ace-spinner w-3 h-3" />}
-                  {joinModal.busy ? '加入中…' : '加入团队'}
-                </button>
-              </div>
-            </form>
-          )}
-        </Modal>
+      {createOpen && (
+        <TeamCreateModal onClose={() => setCreateOpen(false)} onCreated={afterCreated} />
+      )}
+      {joinOpen && (
+        <TeamJoinModal onClose={() => setJoinOpen(false)} onJoined={notifyTeamConfigChanged} />
       )}
     </div>
   );
 }
+

@@ -935,6 +935,7 @@ static AppConfig load_config_from_path_once(
                         fj["completed_turn_self_heal"].get<bool>();
                 }
             }
+            if (j.contains("team")) load_team_config_json(j["team"], cfg.team);
             if (j.contains("skills") && j["skills"].is_object()) {
                 const auto& sj = j["skills"];
                 if (sj.contains("scan_paths") && sj["scan_paths"].is_array() &&
@@ -2607,6 +2608,9 @@ nlohmann::json build_config_json(const AppConfig& cfg) {
         if (cfg.features.completed_turn_self_heal != features_d.completed_turn_self_heal)
             featuresj["completed_turn_self_heal"] = cfg.features.completed_turn_self_heal;
         if (!featuresj.empty()) j["features"] = featuresj;
+
+        if (auto teamj = team_config_to_json(cfg.team); !teamj.empty())
+            j["team"] = std::move(teamj);
 
         WebSearchConfig ws_d;
         nlohmann::json wsj = nlohmann::json::object();

@@ -227,6 +227,38 @@ TEST(QuotaService, LocalStatusExhausted) {
     EXPECT_FALSE(local_quota_status(meta, "guid-a", ledger, now_ms).exhausted());
 }
 
+// 账号级共享池(add-team-workdir-sidebar 反馈轮):额度属于登录账号,
+// 已用为本机所有团队账本当日之和;负额度回退默认值。
+TEST(QuotaService, AccountPoolSumsAcrossTeams) {
+    TempDir temp;
+    const std::int64_t now_ms = 1'700'000'000'000;
+    ASSERT_TRUE(QuotaLedger(temp.utf8(), "team-1")
+                    .record(team_session("s-1"), usage(10'000'000), now_ms, nullptr));
+    ASSERT_TRUE(QuotaLedger(temp.utf8(), "team-2")
+                    .record(team_session("s-2", "team-2"), usage(15'000'000), now_ms, nullptr));
+
+    TeamMeta team1 = team_with_member();
+    team1.team_id = "team-1";
+    TeamMeta team2 = team_with_member();
+    team2.team_id = "team-2";
+
+    const auto status = account_quota_status(30'000'000, temp.utf8(), {team1, team2}, now_ms);
+    EXPECT_EQ(status.used, 25'000'000); // 两团队之和 = 共享池已用
+    EXPECT_FALSE(status.exhausted());
+
+    // 超过账号额度即用尽(单团队未超也会被共享池拦住)
+    EXPECT_TRUE(account_quota_status(20'000'000, temp.utf8(), {team1, team2}, now_ms)
+                    .exhausted());
+    // 0 额度 = 当日不承接
+    EXPECT_TRUE(account_quota_status(0, temp.utf8(), {team1, team2}, now_ms).exhausted());
+    // 非法配置回退默认 30M,不被负值放大
+    EXPECT_EQ(account_quota_status(-5, temp.utf8(), {team1, team2}, now_ms).quota,
+              kDefaultDailyQuotaTokens);
+    // 重复团队 ID 去重,不重复求和
+    EXPECT_EQ(account_quota_status(30'000'000, temp.utf8(), {team1, team1}, now_ms).used,
+              10'000'000);
+}
+
 // 4.3 场景: 额度用尽 → 本机 host 会话置 paused(额度已用尽),别人的会话不动
 TEST(QuotaService, ExhaustionPausesSelfHostedSessions) {
     TempDir temp;

@@ -59,6 +59,16 @@ SettingsMutationResult set_remote_web_enabled(
     bool enabled,
     const SettingsMutationOptions& options = {});
 
+// 团队协作(openspec add-team-workdir-sidebar 反馈轮):功能开关(默认关,
+// 关闭时 daemon 停用团队模块)与本机登录账号的每日 token 额度(账号下所有
+// 团队共享同一个池)。
+SettingsMutationResult set_team_enabled(
+    bool enabled,
+    const SettingsMutationOptions& options = {});
+SettingsMutationResult set_team_account_quota(
+    std::int64_t account_daily_token_quota,
+    const SettingsMutationOptions& options = {});
+
 SettingsMutationResult set_tui_theme(
     const std::string& theme,
     const SettingsMutationOptions& options = {});

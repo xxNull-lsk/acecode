@@ -95,6 +95,14 @@ TEST(TeamHandler, StateJsonIncludesSelfStatus) {
     EXPECT_EQ(j["self"]["guid"], "guid-a");
     EXPECT_EQ(j["self"]["daily_token_quota"], kDefaultDailyQuotaTokens);
     EXPECT_FALSE(j["self"]["quota_exhausted"].get<bool>());
+    // 未设置本机状态时不出现 local 字段(稀疏)
+    EXPECT_FALSE(j.contains("local"));
+
+    // 设置了工作目录时携带(本机团队状态,广播侧自行决定是否下发)
+    team::TeamLocalState local;
+    local.work_dir = "/home/a/demo";
+    const auto with_local = team_state_json(meta, "guid-a", ledger, 1'700'000'000, local);
+    EXPECT_EQ(with_local["local"]["work_dir"], "/home/a/demo");
 }
 
 // 场景: 会话发起请求体校验

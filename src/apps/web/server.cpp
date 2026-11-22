@@ -198,7 +198,13 @@ WebServer::WebServer(WebServerDeps deps)
     install_crow_log_bridge();
     impl_->app.exception_handler(&route_exception_handler);
     impl_->initialize_sharing();
-    impl_->initialize_team();
+    {
+        // 团队功能默认关闭(config team.enabled):关闭时不启动团队模块。
+        std::shared_lock<std::shared_mutex> config_lock(impl_->app_config_mu);
+        const bool team_enabled = impl_->deps.app_config &&
+                                  impl_->deps.app_config->team.enabled;
+        if (team_enabled) impl_->initialize_team();
+    }
     impl_->register_routes();
     impl_->initialize_model_reasoning_sync();
 }

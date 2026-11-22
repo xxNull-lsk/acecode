@@ -71,6 +71,7 @@ import {
   sessionReferencesFromEntries,
 } from '../lib/sessionReferenceDrop.js';
 import { SidebarSessionSelectionContext, useSidebarSessionSelection } from '../lib/useSidebarSessionSelection.js';
+import { TeamCreateModal, TeamJoinModal } from './TeamMembershipModals.jsx';
 import { createWorkspaceFolderOrderController } from '../lib/workspaceFolderOrder.js';
 import { useWorkspaceFolderReorder } from '../lib/useWorkspaceFolderReorder.js';
 import '../styles/workspaceFolderReorder.css';
@@ -640,8 +641,8 @@ function SidebarNavItem({ item, onClick }) {
   );
 }
 
-function SidebarSectionHeader({ sectionId, count, expanded, onToggle, actions = null }) {
-  if (!sidebarSectionIsVisible(count)) return null;
+function SidebarSectionHeader({ sectionId, count, expanded, onToggle, actions = null, alwaysVisible = false }) {
+  if (!sidebarSectionIsVisible(count) && !alwaysVisible) return null;
   const title = sidebarSectionTitle(sectionId, count);
   return (
     <div
@@ -1965,6 +1966,9 @@ function TeamGroup({
   onSelect,
   onTakeover,
   takeoverBusySessionId,
+  onNewSession,
+  newSessionBusy = false,
+  onOpenSettings,
 }) {
   const view = teamSidebarTeam(team);
   if (!view) return null;
@@ -1992,6 +1996,28 @@ function TeamGroup({
         </span>
         <span className="ace-sidebar-tree-content min-w-0 truncate font-normal">{view.name}</span>
         <span className="flex items-center justify-end gap-1 shrink-0 text-[12px] text-fg-mute pr-[3px]">
+          {/* 悬停团队行 → 右侧出现「新建团队会话」(与工作区新建任务同款显隐)。 */}
+          <button
+            type="button"
+            disabled={newSessionBusy}
+            onPointerDown={preserveComposerFocusOnPointerDown}
+            onClick={(e) => { e.stopPropagation(); onNewSession?.(); }}
+            className="w-6 h-6 rounded text-fg-mute hover:text-fg hover:bg-surface-hi flex items-center justify-center shrink-0 opacity-0 group-hover:opacity-100 focus:opacity-100 transition disabled:opacity-40"
+            title="新建团队会话"
+            aria-label="新建团队会话"
+          >
+            {newSessionBusy ? <span className="ace-spinner h-3 w-3" role="status" aria-label="发起中" /> : <VsIcon name="newSession" size={18} />}
+          </button>
+          <button
+            type="button"
+            onPointerDown={preserveComposerFocusOnPointerDown}
+            onClick={(e) => { e.stopPropagation(); onOpenSettings?.(view.teamId); }}
+            className="w-6 h-6 rounded text-fg-mute hover:text-fg hover:bg-surface-hi flex items-center justify-center shrink-0 opacity-0 group-hover:opacity-100 focus:opacity-100 transition"
+            title="团队设置"
+            aria-label="团队设置"
+          >
+            <VsIcon name="settings" size={18} />
+          </button>
           {view.sessionCount > 0 && <span className="tabular-nums">{view.sessionCount}</span>}
           <SidebarDisclosure expanded={expanded} />
         </span>
@@ -2150,10 +2176,21 @@ export function Sidebar({
   // 挂载拉一次;设置页创建/加入团队后经 acecode:teams-changed 通知刷新;
   // 分组展开且可见时低频轮询,保持团队会话列表与状态可看。
   const [teamStates, setTeamStates] = useState([]);
+  const [teamEnabled, setTeamEnabled] = useState(null); // null = 未知,视为关闭前不显示
   const teamsLoadSeqRef = useRef(0);
   const loadTeams = useStableCallback(async () => {
     const seq = ++teamsLoadSeqRef.current;
     try {
+      // 功能开关默认关闭:关闭时 daemon 停用团队模块(503),侧边栏不显示
+      // 团队栏目;开启后经 acecode:team-config-changed 重新加载。
+      const config = await api.getTeamConfig();
+      if (seq !== teamsLoadSeqRef.current) return;
+      const enabled = config?.enabled === true;
+      setTeamEnabled(enabled);
+      if (!enabled) {
+        setTeamStates([]);
+        return;
+      }
       const result = await api.listTeams();
       if (seq !== teamsLoadSeqRef.current) return;
       setTeamStates(Array.isArray(result?.teams) ? result.teams : []);
@@ -2168,10 +2205,16 @@ export function Sidebar({
     });
   });
   const [teamTakeoverBusyId, setTeamTakeoverBusyId] = useState('');
+  // 团队分组的创建/加入入口(悬停团队标题右侧);与设置页共用弹框组件。
+  const [teamModal, setTeamModal] = useState(null); // 'create' | 'join' | null
   useEffect(() => { loadTeams(); }, [loadTeams]);
   useEffect(() => {
     window.addEventListener('acecode:teams-changed', loadTeams);
-    return () => window.removeEventListener('acecode:teams-changed', loadTeams);
+    window.addEventListener('acecode:team-config-changed', loadTeams);
+    return () => {
+      window.removeEventListener('acecode:teams-changed', loadTeams);
+      window.removeEventListener('acecode:team-config-changed', loadTeams);
+    };
   }, [loadTeams]);
 
   // 从侧边栏发起接管:与设置页同一流程(先确保本机仓库已登记,再接管)。
@@ -2196,6 +2239,48 @@ export function Sidebar({
       toast({ kind: 'err', text: mapped[code] || '接管失败,请重试' });
     } finally {
       setTeamTakeoverBusyId('');
+    }
+  });
+
+  // 团队行悬停「新建团队会话」:与设置页同一流程(repo 未关联时先关联再重试),
+  // 成功后直接打开新会话(响应带本机定位投影)。
+  const [teamNewSessionBusyId, setTeamNewSessionBusyId] = useState('');
+  const startTeamSessionFromSidebar = useStableCallback(async (teamId) => {
+    setTeamNewSessionBusyId(teamId);
+    try {
+      let ref;
+      try {
+        ref = await api.startTeamSession(teamId, {});
+      } catch (e) {
+        if (e?.body?.error === 'repo_not_linked') {
+          await api.linkTeamRepo(teamId, '');
+          ref = await api.startTeamSession(teamId, {});
+        } else {
+          throw e;
+        }
+      }
+      toast({ kind: 'ok', text: '团队会话已发起' });
+      loadTeams();
+      if (ref?.session_id) {
+        const workspaceHash = ref.workspace_hash || '';
+        selectSession(
+          workspaceHash ? { hash: workspaceHash } : { noWorkspace: true },
+          { id: ref.session_id, workspace_hash: workspaceHash, cwd: ref.cwd || '', title: ref.title || '' },
+        );
+      }
+    } catch (e) {
+      const code = e?.body?.error || '';
+      const mapped = {
+        too_many_concurrent_sessions: '团队并发会话已达上限(5)',
+        quota_exhausted: '本机当日额度已用尽',
+        workdir_not_git_repo: '本机团队工作目录不是 git 仓库',
+        repo_mismatch: '本机工作目录与团队仓库不匹配',
+        session_create_failed: '会话创建失败,请重试',
+        meta_write_failed: '会话标记写入失败,请重试',
+      };
+      toast({ kind: 'err', text: mapped[code] || '发起团队会话失败,请重试' });
+    } finally {
+      setTeamNewSessionBusyId('');
     }
   });
   const [activeWorkspaceHash, setActiveWorkspaceHash] = useStructuralState('');
@@ -3546,12 +3631,13 @@ export function Sidebar({
     [pinnedSessions, unpinnedNoWorkspaceSessions, workspaces, teamStates],
   );
 
-  // 团队分组展开时低频轮询(团队会话状态在别处变更也能看到)。
+  // 团队分组展开时低频轮询(团队会话状态在别处变更也能看到);功能关闭时不轮询。
   useEffect(() => {
-    if (!sectionExpansion.teams || !sidebarSectionIsVisible(sectionCounts.teams)) return undefined;
+    if (teamEnabled === false) return undefined;
+    if (!sectionExpansion.teams) return undefined;
     const timer = setInterval(loadTeams, 15000);
     return () => clearInterval(timer);
-  }, [loadTeams, sectionExpansion.teams, sectionCounts.teams]);
+  }, [loadTeams, teamEnabled, sectionExpansion.teams]);
 
   useEffect(() => {
     if (!selectedRevealTarget.sessionId) {
@@ -4617,9 +4703,79 @@ export function Sidebar({
                 onRemoteControlSurgeCompleted={completeRemoteControlSurge}
               />
             )}
+            {teamEnabled !== false && (
+              <>
+                <SidebarSectionHeader
+                  sectionId={SIDEBAR_SECTION_IDS.TEAMS}
+                  count={sectionCounts.teams}
+                  expanded={sectionExpansion.teams}
+                  onToggle={() => toggleSidebarSection(SIDEBAR_SECTION_IDS.TEAMS)}
+                  alwaysVisible
+                  actions={(
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => setTeamModal('create')}
+                        className="w-6 h-6 rounded text-fg-mute hover:text-fg hover:bg-surface-hi flex items-center justify-center shrink-0 transition"
+                        title="新建团队"
+                        aria-label="新建团队"
+                      >
+                        <VsIcon name="folderAdd" size={18} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setTeamModal('join')}
+                        className="w-6 h-6 rounded text-fg-mute hover:text-fg hover:bg-surface-hi flex items-center justify-center shrink-0 transition"
+                        title="加入团队"
+                        aria-label="加入团队"
+                      >
+                        <VsIcon name="add" size={18} />
+                      </button>
+                    </>
+                  )}
+                />
+                {teamEnabled === true && sectionExpansion.teams && (
+                  <div className="my-1">
+                    {teamStates.length === 0 && (
+                      <div className="ace-sidebar-tree-row-grid ace-sidebar-meta-text grid grid-cols-[24px_minmax(0,1fr)_auto] items-center gap-x-[7px] mx-1.5 pl-[3px] pr-[14px] py-[4px] text-[13px] text-fg-mute italic">
+                        <span aria-hidden="true" />
+                        <span>悬停标题可新建或加入团队</span>
+                      </div>
+                    )}
+                    {teamStates.map((team) => (
+                      <TeamGroup
+                        key={team.team_id}
+                        team={team}
+                        expanded={expandedTeamGroups.has(team.team_id)}
+                        onToggle={toggleTeamGroup}
+                        visibleLimit={expandedSessionLists.get(`team:${team.team_id}`)}
+                        onToggleSessionList={toggleSessionListExpanded}
+                        activeId={activeId}
+                        onSelect={(row) => {
+                          if (suppressSessionClickRef.current) return;
+                          const target = teamSessionOpenTarget(row);
+                          if (!target) return;
+                          selectSession(
+                            target.noWorkspace ? { noWorkspace: true } : { hash: target.workspaceHash },
+                            { id: row.id, workspace_hash: target.workspaceHash, cwd: target.cwd, title: row.title },
+                          );
+                        }}
+                        onTakeover={(row) => takeoverTeamSessionFromSidebar(team.team_id, row.id)}
+                        takeoverBusySessionId={teamTakeoverBusyId}
+                        onNewSession={() => startTeamSessionFromSidebar(team.team_id)}
+                        newSessionBusy={teamNewSessionBusyId === team.team_id}
+                        onOpenSettings={(openTeamId) => {
+                          window.dispatchEvent(new CustomEvent('acecode:open-team-settings', { detail: { teamId: openTeamId } }));
+                          onOpenSettingsSection?.('team');
+                        }}
+                      />
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
             <SidebarSectionHeader
-              sectionId={SIDEBAR_SECTION_IDS.WORKSPACES}
-              count={sectionCounts.workspaces}
+              sectionId={SIDEBAR_SECTION_IDS.WORKSPACES}              count={sectionCounts.workspaces}
               expanded={sectionExpansion.workspaces}
               onToggle={() => toggleSidebarSection(SIDEBAR_SECTION_IDS.WORKSPACES)}
               actions={(
@@ -4709,38 +4865,6 @@ export function Sidebar({
                     />
                   );
                 })}
-              </div>
-            )}
-            <SidebarSectionHeader
-              sectionId={SIDEBAR_SECTION_IDS.TEAMS}
-              count={sectionCounts.teams}
-              expanded={sectionExpansion.teams}
-              onToggle={() => toggleSidebarSection(SIDEBAR_SECTION_IDS.TEAMS)}
-            />
-            {sidebarSectionIsVisible(sectionCounts.teams) && sectionExpansion.teams && (
-              <div className="my-1">
-                {teamStates.map((team) => (
-                  <TeamGroup
-                    key={team.team_id}
-                    team={team}
-                    expanded={expandedTeamGroups.has(team.team_id)}
-                    onToggle={toggleTeamGroup}
-                    visibleLimit={expandedSessionLists.get(`team:${team.team_id}`)}
-                    onToggleSessionList={toggleSessionListExpanded}
-                    activeId={activeId}
-                    onSelect={(row) => {
-                      if (suppressSessionClickRef.current) return;
-                      const target = teamSessionOpenTarget(row);
-                      if (!target) return;
-                      selectSession(
-                        target.noWorkspace ? { noWorkspace: true } : { hash: target.workspaceHash },
-                        { id: row.id, workspace_hash: target.workspaceHash, cwd: target.cwd, title: row.title },
-                      );
-                    }}
-                    onTakeover={(row) => takeoverTeamSessionFromSidebar(team.team_id, row.id)}
-                    takeoverBusySessionId={teamTakeoverBusyId}
-                  />
-                ))}
               </div>
             )}
           </div>
@@ -4889,6 +5013,12 @@ export function Sidebar({
           onSaved={saveEditedWorkspace}
           onRemove={removeWorkspace}
         />
+      )}
+      {teamModal === 'create' && (
+        <TeamCreateModal onClose={() => setTeamModal(null)} onCreated={loadTeams} />
+      )}
+      {teamModal === 'join' && (
+        <TeamJoinModal onClose={() => setTeamModal(null)} onJoined={loadTeams} />
       )}
     </>
   );

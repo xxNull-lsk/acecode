@@ -116,6 +116,12 @@ void merge_local_session_info_into_state(json& state) {
 // =====================================================================
 
 void WebServer::Impl::initialize_team() {
+    // 配置开关默认关闭:关闭时不启动团队模块(团队路由按 team_service 为空
+    // 统一返回 503);开启/重启后原样恢复已创建/已加入的团队数据。
+    if (deps.app_config) {
+        std::shared_lock<std::shared_mutex> config_lock(app_config_mu);
+        if (!deps.app_config->team.enabled) return;
+    }
     try {
         const auto directory = path_to_utf8(path_from_utf8(projects_dir()).parent_path());
         team_service = std::make_shared<team::TeamService>(
@@ -124,6 +130,21 @@ void WebServer::Impl::initialize_team() {
     } catch (const std::exception& error) {
         LOG_WARN(std::string("[team] init failed: ") + error.what());
     }
+}
+
+// 账号级共享池状态:额度来自配置,已用为本机所有团队账本当日之和。
+// 额度属于登录账号而非设备(team.account_daily_token_quota);team_service
+// 为空(功能关闭)时返回 nullopt。
+std::optional<team::DeviceQuotaStatus> WebServer::Impl::team_account_quota_status() {
+    if (!team_service) return std::nullopt;
+    std::int64_t quota = team::kDefaultDailyQuotaTokens;
+    if (deps.app_config) {
+        std::shared_lock<std::shared_mutex> config_lock(app_config_mu);
+        quota = deps.app_config->team.account_daily_token_quota;
+    }
+    return team::account_quota_status(quota, team_service->data_dir(),
+                                      team_service->load_teams(),
+                                      team_service->now() * 1000);
 }
 
 void WebServer::Impl::stop_team() {
@@ -230,8 +251,11 @@ void WebServer::Impl::broadcast_team_state(const std::string& team_id) {    if (
     const auto meta = team_service->load_team(team_id);
     if (!meta) return;
     const team::QuotaLedger ledger(team_service->data_dir(), team_id);
+    const auto local_state = team_service->store_for(team_id).load_local_state();
+    const auto account_status = team_account_quota_status();
     auto state = web::team_state_json(*meta, team_service->self().guid, ledger,
-                                      team_service->now());
+                                      team_service->now(), local_state,
+                                      account_status ? &*account_status : nullptr);
     // 本机定位投影只发给本机 UI(daemon token 连接):各设备本地路径不同,
     // 本机路径对其他设备没有意义,也不该随状态广播出去。
     json plain_state = state;
@@ -430,8 +454,11 @@ void WebServer::Impl::register_team() {
         auto result = json::array();
         for (const auto& meta : team_service->load_teams()) {
             team::QuotaLedger ledger(team_service->data_dir(), meta.team_id);
+            const auto account_status = team_account_quota_status();
             auto state = web::team_state_json(meta, team_service->self().guid, ledger,
-                                              team_service->now());
+                                              team_service->now(),
+                                              team_service->store_for(meta.team_id).load_local_state(),
+                                              account_status ? &*account_status : nullptr);
             // 本机 UI 的 REST 响应:本机存在的会话补 cwd/workspace_hash,
             // 供侧边栏把团队会话当普通会话打开。
             merge_local_session_info_into_state(state);
@@ -449,8 +476,11 @@ void WebServer::Impl::register_team() {
         const auto meta = team_service->load_team(team_id);
         if (!meta) return team_error(req, 404, "team_not_found");
         team::QuotaLedger ledger(team_service->data_dir(), team_id);
+        const auto account_status = team_account_quota_status();
         auto state = web::team_state_json(*meta, team_service->self().guid, ledger,
-                                          team_service->now());
+                                          team_service->now(),
+                                          team_service->store_for(team_id).load_local_state(),
+                                          account_status ? &*account_status : nullptr);
         merge_local_session_info_into_state(state);
         return team_response(req, 200, state.dump());
     });
@@ -633,6 +663,30 @@ void WebServer::Impl::register_team() {
                                             {"value", repo.identity.value}}.dump());
     });
 
+    // 设置本机团队工作目录(每设备本地状态):团队会话缺省在此发起;目录
+    // 身份与团队已登记仓库匹配时顺带补登记(幂等)。
+    CROW_ROUTE(app, "/api/team/<string>/workdir").methods(crow::HTTPMethod::POST)
+    ([this](const crow::request& req, const std::string& team_id) {
+        if (auto denied = require_auth(req)) return std::move(*denied);
+        if (!team_service) return team_error(req, 503, "team_unavailable");
+        const auto body = json::parse(req.body, nullptr, false);
+        if (!body.is_object() || !body.contains("cwd") || !body["cwd"].is_string() ||
+            body["cwd"].get<std::string>().empty())
+            return team_error(req, 400, "invalid_cwd");
+        team::TeamLocalState local;
+        local.work_dir = body["cwd"].get<std::string>();
+        if (!team_service->store_for(team_id).save_local_state(local))
+            return team_error(req, 500, "local_state_write_failed");
+        if (const auto repo = team::resolve_repo_identity(local.work_dir)) {
+            if (const auto meta = team_service->load_team(team_id);
+                meta && !meta->repos.empty() && team::team_matches_repo(*meta, repo.identity)) {
+                (void)team_service->register_repo(team_id, repo.identity);
+            }
+        }
+        broadcast_team_state(team_id);
+        return team_response(req, 200, json{{"work_dir", local.work_dir}}.dump());
+    });
+
     // 发起团队会话:创建本地会话 → 标记团队 meta → 登记 session_refs(host)。
     CROW_ROUTE(app, "/api/team/<string>/session").methods(crow::HTTPMethod::POST)
     ([this](const crow::request& req, const std::string& team_id) {
@@ -651,6 +705,13 @@ void WebServer::Impl::register_team() {
         // 仓库身份必须已关联团队
         const auto repo = team::resolve_repo_identity(cwd);
         if (!repo) return team_error(req, 400, repo.error);
+
+        // 账号级共享池准入:额度属于登录账号,账号下所有团队共享;用尽时
+        // 拒绝发起新会话(发起侧的额度准入此前缺失,接管侧已有)。
+        if (const auto account_status = team_account_quota_status();
+            account_status && account_status->exhausted()) {
+            return team_error(req, 429, "quota_exhausted");
+        }
 
         SessionOptions opts;
         opts.cwd = cwd;
@@ -755,6 +816,11 @@ void WebServer::Impl::register_team() {
         team::TeamTakeover takeover(*team_service, std::move(fetch),
             [this](const std::string& sid) {
                 return deps.session_client->resume_session(sid);
+            },
+            [this]() {
+                // 接管资格以账号级共享池为准;模块关闭时不做账号判定。
+                const auto status = team_account_quota_status();
+                return status && status->exhausted();
             });
         const auto outcome = takeover.take_over(team_id, session_id, cwd,
             SessionStorage::get_project_dir(cwd));

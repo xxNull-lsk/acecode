@@ -172,6 +172,32 @@ SettingsMutationResult set_invite_clipboard_detection(bool enabled, const Settin
     }, options);
 }
 
+SettingsMutationResult set_team_enabled(bool enabled, const SettingsMutationOptions& options) {
+    return run_mutation(
+        [enabled](AppConfig& cfg, std::string&) {
+            if (cfg.team.enabled == enabled) return false;
+            cfg.team.enabled = enabled;
+            return true;
+        },
+        options);
+}
+
+SettingsMutationResult set_team_account_quota(
+    std::int64_t account_daily_token_quota,
+    const SettingsMutationOptions& options) {
+    return run_mutation(
+        [account_daily_token_quota](AppConfig& cfg, std::string& error) {
+            if (account_daily_token_quota < 0) {
+                error = "invalid_quota";
+                return false;
+            }
+            if (cfg.team.account_daily_token_quota == account_daily_token_quota) return false;
+            cfg.team.account_daily_token_quota = account_daily_token_quota;
+            return true;
+        },
+        options);
+}
+
 SettingsMutationResult set_remote_web_enabled(
     bool enabled,
     const SettingsMutationOptions& options) {

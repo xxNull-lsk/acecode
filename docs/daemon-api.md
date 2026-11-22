@@ -6857,7 +6857,7 @@ Runtime-generated names use underscore separators. Existing hyphen-named data re
 | 方法与路径 | 请求 / 返回 |
 | --- | --- |
 | `POST /api/team` | `{name, cwd, repo_url?}`；创建团队，创建者即管理员。工作目录是 git 仓库时仓库身份从目录解析，否则 `repo_url` 必填（远程 URL，本地路径/`file://` 拒绝）；创建成功即完成仓库登记并记住本机团队工作目录。错误码：`invalid_name`/`invalid_cwd`/`invalid_repo_url`/`workdir_not_git_repo` |
-| `GET /api/team` | `{teams: [...]}`；含成员（在线状态、每日额度、最后已知已用）、会话引用与本机承接能力 `self`；本机存在的团队会话引用额外带 `cwd`/`workspace_hash`（本机定位投影，仅本机 UI 可见） |
+| `GET /api/team` | `{teams: [...]}`；含成员（在线状态、每日额度、最后已知已用）、会话引用与本机承接能力 `self`；本机存在的团队会话引用额外带 `cwd`/`workspace_hash`（本机定位投影，仅本机 UI 可见）；设置过本机团队工作目录的响应带 `local: {work_dir}`（仅本机 UI） |
 | `GET /api/team/:team_id` | 单个团队状态，结构同上（含本机定位投影） |
 | `POST /api/team/:team_id/invite` | `{addresses?, port?}`；签发一次性邀请码，返回 `{link, expires_at}`；链接 15 分钟内有效且只能消费一次。载荷携带团队 remote 类仓库身份（最多 4 条），供加入方预检 |
 | `POST /api/team/join` | `{link, cwd}`；先在本地预检：解析工作目录仓库身份并与邀请码携带的团队仓库身份匹配，不匹配（`repo_mismatch`/`workdir_not_git_repo`）不发起连接、不消费邀请码；匹配通过后从邀请者拉全量快照并落盘，自动登记本机仓库身份并记住工作目录（快照无仓库的旧团队直接登记本机身份） |
@@ -6866,9 +6866,17 @@ Runtime-generated names use underscore separators. Existing hyphen-named data re
 | `POST /api/team/:team_id/sync` | `{address, port}`；从指定在线队员拉取合并并回推本机合并结果 |
 | `POST /api/team/:team_id/session` | `{cwd?, title?}`；发起团队会话：仓库身份必须已关联团队、并发 ≤ 5，本机成为 host，`SessionMeta` 打 `team_id/team_role` 标记。cwd 缺省链：显式 cwd → 本机团队工作目录 → daemon 工作目录 |
 | `POST /api/team/:team_id/session/:sid/state` | `{state: "running"/"paused"/"ended", pause_reason?}` |
-| `POST /api/team/:team_id/session/:sid/takeover` | `{cwd}`；手动接管：资格校验（在线源或最近副本 + 本机额度）→ 取数 → `git fetch` + `--ff-only pull` 对齐源 HEAD（不自动 commit/push，失败即中止保持暂停）→ 切 host → resume |
+| `POST /api/team/:team_id/session/:sid/takeover` | `{cwd}`；手动接管：资格校验（在线源或最近副本 + 账号级共享池额度）→ 取数 → `git fetch` + `--ff-only pull` 对齐源 HEAD（不自动 commit/push，失败即中止保持暂停）→ 切 host → resume |
+| `POST /api/team/:team_id/workdir` | `{cwd}`；设置本机团队工作目录（每设备本地状态），目录身份与团队已登记仓库匹配时顺带补登记 |
 
 本机团队工作目录存 `~/.acecode/team/<team_id>/local.json`（`{work_dir}`），是每设备本地状态，不随团队元数据同步。
+
+### 全局配置（daemon token）
+
+| 方法与路径 | 请求 / 返回 |
+| --- | --- |
+| `GET /api/config/team` | `{enabled, account_daily_token_quota}`；团队功能开关（默认 `false`，关闭时团队模块停用、团队路由 503、主界面无团队栏目）与本机登录账号的每日 token 额度（默认 30M，账号下所有团队共享同一个池，UTC 日重置；0 = 当日不承接） |
+| `PUT /api/config/team` | `{enabled?, account_daily_token_quota?}`；即时保存并生效：开启拉起团队模块、关闭断开连接退订并停用（数据保留）；额度变更同步进各团队本机成员记录供其他设备展示。发起团队会话与接管以账号级共享池为准（`used` 为本机所有团队账本当日之和） |
 
 ### 队员互访接口（X-ACECode-Team-Token）
 

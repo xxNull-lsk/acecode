@@ -60,7 +60,10 @@ struct TakeoverOutcome {
 class TeamTakeover {
 public:
     // fetch 仅在源 host 在线时被调用;resume 空则跳过恢复步骤(仍完成切换)。
-    TeamTakeover(TeamService& service, SourceDataFetcher fetch, SessionResumer resume);
+    // account_quota_exhausted 非空时接管资格以账号级共享池为准(额度属于
+    // 登录账号,账号下所有团队共享);空则退回成员记录口径(测试路径)。
+    TeamTakeover(TeamService& service, SourceDataFetcher fetch, SessionResumer resume,
+                 std::function<bool()> account_quota_exhausted = {});
 
     // 本机把 team_id/session_id 接管过来。cwd 为本机项目目录(git 对齐在它
     // 之下执行),project_dir 为会话文件目录(生产侧用
@@ -72,6 +75,7 @@ private:
     TeamService& service_;
     SourceDataFetcher fetch_;
     SessionResumer resume_;
+    std::function<bool()> account_quota_exhausted_;
 };
 
 // git 对齐(5.3):fetch + --ff-only pull 到 head_commit。head 为空或已在该

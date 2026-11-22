@@ -339,6 +339,12 @@ struct WebServer::Impl {
     // 本机 host 团队会话的事件订阅(session_id → subscription id),连接断开
     // 后保留,daemon 退出时统一退订。
     std::unordered_map<std::string, std::uint64_t> team_session_subs;
+    // 配置开关启停团队模块的生命周期互斥(PUT /api/config/team),与 team_mu
+    // 分开:stop_team 内部持 team_mu,外层再持会自锁。
+    std::mutex team_lifecycle_mu;
+    // 账号级共享池状态:额度来自配置(team.account_daily_token_quota),
+    // 已用为本机所有团队账本当日之和。team_service 为空时返回 nullopt。
+    std::optional<team::DeviceQuotaStatus> team_account_quota_status();
     void initialize_team();
     void stop_team();
     void register_team();

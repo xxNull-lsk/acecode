@@ -1,6 +1,7 @@
 #include "team_handler.hpp"
 
 #include "team_host/team_service.hpp"
+#include "team/team_store.hpp"
 
 namespace acecode::web {
 
@@ -51,7 +52,9 @@ nlohmann::json team_session_ref_public_json(const team::TeamSessionRef& ref) {
 nlohmann::json team_state_json(const team::TeamMeta& meta,
                                const std::string& self_guid,
                                const team::QuotaLedger& ledger,
-                               std::int64_t now_seconds) {
+                               std::int64_t now_seconds,
+                               const team::TeamLocalState& local,
+                               const team::DeviceQuotaStatus* account_status) {
     nlohmann::json j = team_meta_public_json(meta);
     auto members = nlohmann::json::array();
     for (const auto& member : meta.members)
@@ -63,13 +66,18 @@ nlohmann::json team_state_json(const team::TeamMeta& meta,
     j["sessions"] = sessions;
 
     // 本机承接能力:额度用尽时发起/切入手稿被拒,前端用它隐藏入口并提示。
-    const auto self_status = team::local_quota_status(meta, self_guid, ledger, now_seconds * 1000);
+    // 传了 account_status(账号级共享池)时以它为准,否则退回成员记录口径。
+    const auto self_status = account_status
+        ? *account_status
+        : team::local_quota_status(meta, self_guid, ledger, now_seconds * 1000);
     j["self"] = {
         {"guid", self_guid},
         {"daily_token_quota", self_status.quota},
         {"quota_used_today", self_status.used},
         {"quota_exhausted", self_status.exhausted()},
     };
+    // 本机团队状态:工作目录(每设备本地状态,调用方决定是否下发到别的设备)。
+    if (!local.work_dir.empty()) j["local"] = {{"work_dir", local.work_dir}};
     return j;
 }
 

@@ -155,6 +155,25 @@ DeviceQuotaStatus local_quota_status(const TeamMeta& meta, const std::string& gu
     return status;
 }
 
+DeviceQuotaStatus account_quota_status(std::int64_t account_quota,
+                                       const std::string& data_dir,
+                                       const std::vector<TeamMeta>& teams,
+                                       std::int64_t now_ms) {
+    DeviceQuotaStatus status;
+    status.day = now_ms / kQuotaDayMs;
+    status.quota = account_quota < 0 ? kDefaultDailyQuotaTokens : account_quota;
+    // 共享池:本机账号下所有团队的账本当日用量求和(团队 ID 去重)。
+    std::int64_t used = 0;
+    std::string last_team_id;
+    for (const auto& meta : teams) {
+        if (meta.team_id.empty() || meta.team_id == last_team_id) continue;
+        last_team_id = meta.team_id;
+        used += QuotaLedger(data_dir, meta.team_id).used_for_day(status.day);
+    }
+    status.used = used;
+    return status;
+}
+
 DeviceQuotaStatus member_quota_snapshot(const TeamMeta& meta, const std::string& guid,
                                         std::int64_t now_ms) {
     DeviceQuotaStatus status;
