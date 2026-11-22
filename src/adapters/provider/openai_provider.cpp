@@ -6,7 +6,6 @@
 #include "text_tool_call_recovery.hpp"
 #include "session/session_history_recovery.hpp"
 #include "image/image_processor.hpp"
-#include "config/request_headers.hpp"
 #include "session/attachment_prompt_context.hpp"
 #include "session/attachment_store.hpp"
 #include "session/output_attachments.hpp"
@@ -1250,7 +1249,7 @@ ChatResponse OpenAiCompatProvider::chat_cancellable_impl(
         headers["Authorization"] = "Bearer " + api_key_;
     }
     std::string header_error;
-    auto resolved_headers = resolve_request_headers(request_headers_, header_error);
+    auto resolved_headers = request_options_.resolve_headers(request_headers_, url, call_options, header_error);
     if (!resolved_headers.has_value()) {
         return make_chat_error_response(make_provider_error(
             ProviderErrorKind::Unknown,
@@ -1973,17 +1972,24 @@ ChatResponse OpenAiCompatProvider::parse_sse_stream(
         }
 
         if (error_info.retryable) {
+            error_info.retry_max_attempts = -1;
+            if (auto delay = parse_retry_after_ms(header_value_ci(r.header, "Retry-After"))) {
+                error_info.server_retry_after_ms = *delay;
+            }
+            apply_acemodel_limit_policy(error_info, is_acemodel_request_endpoint("/chat/completions") ||
+                !header_value_ci(r.header, "X-ACEModel-Limit").empty(), attempt - 1);
+        }
+        if (error_info.retryable) {
             const int delay_ms = retry_after_delay_ms(
                 r.header, attempt, error_info.status_code, error_info.raw_body);
             error_info.retry_attempt = saturating_retry_attempt(attempt);
-            error_info.retry_max_attempts = -1;
             error_info.retry_delay_ms = delay_ms;
             LOG_WARN("Retrying streaming request after " +
                      provider_error_kind_to_string(error_info.kind) +
                      " failure; retry=" +
                      std::to_string(error_info.retry_attempt) +
                      " delay_ms=" + std::to_string(delay_ms) +
-                     " max_attempts=unbounded");
+                     " max_attempts=" + std::to_string(error_info.retry_max_attempts));
             emit_retry_event(callback, error_info);
             if (wait_for_retry(
                     std::chrono::milliseconds(delay_ms), abort_flag)) {
@@ -2005,7 +2011,6 @@ ChatResponse OpenAiCompatProvider::parse_sse_stream(
 
         error_info.retry_attempt =
             saturating_retry_attempt(attempt > 0 ? attempt - 1 : 0);
-        error_info.retry_max_attempts = 0;
         emit_provider_error(callback, error_info);
         return accumulated;
     }

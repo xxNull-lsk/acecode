@@ -9626,6 +9626,39 @@ TEST(WebServerHttp, UiPreferencesSubagentAvatarStyleRoundTrips) {
     EXPECT_EQ(fx.cfg.web_ui.subagent_avatar_style, "geometric");
 }
 
+// 场景:设置 > 常规 > 输入框 里关掉「显示预测消息」、把「后续消息处理方式」改成排队。
+// 期望:GET 默认返回预测开 + steer;单字段 PUT 只改那一项并落盘,之后改别的设置不会把它冲回默认;
+// 类型不对或不认识的值整笔 400,内存配置保持原值。
+TEST(WebServerHttp, UiPreferencesComposerSettingsRoundTrip) {
+    WebServerFixture fx;
+    const auto url = cpr::Url{fx.url("/api/config/ui-preferences")};
+    const cpr::Header headers{{"Content-Type", "application/json"}};
+    const auto initial = json::parse(cpr::Get(url).text);
+    EXPECT_EQ(initial["follow_up_prompts"], true);
+    EXPECT_EQ(initial["busy_send_mode"], "steer");
+    auto off = cpr::Put(url, headers, cpr::Body{R"({"follow_up_prompts":false})"});
+    ASSERT_EQ(off.status_code, 200) << off.text;
+    EXPECT_EQ(json::parse(off.text)["follow_up_prompts"], false);
+    EXPECT_FALSE(fx.cfg.web_ui.follow_up_prompts);
+    auto queue = cpr::Put(url, headers, cpr::Body{R"({"busy_send_mode":"queue"})"});
+    ASSERT_EQ(queue.status_code, 200) << queue.text;
+    EXPECT_EQ(json::parse(queue.text)["busy_send_mode"], "queue");
+    EXPECT_EQ(json::parse(queue.text)["follow_up_prompts"], false);
+    auto other = cpr::Put(url, headers, cpr::Body{R"({"font_size":"large"})"});
+    ASSERT_EQ(other.status_code, 200) << other.text;
+    const auto saved = acecode::load_config_from_path((fx.tmp_dir / "config.json").u8string());
+    EXPECT_FALSE(saved.web_ui.follow_up_prompts);
+    EXPECT_EQ(saved.web_ui.busy_send_mode, "queue");
+    for (const char* body : {R"({"follow_up_prompts":"off"})", R"({"busy_send_mode":"later"})",
+                             R"({"busy_send_mode":true})", R"({"busy_send_mode":"Queue","font_size":"small"})"}) {
+        auto rejected = cpr::Put(url, headers, cpr::Body{body});
+        EXPECT_EQ(rejected.status_code, 400) << body << " " << rejected.text;
+    }
+    EXPECT_FALSE(fx.cfg.web_ui.follow_up_prompts);
+    EXPECT_EQ(fx.cfg.web_ui.busy_send_mode, "queue");
+    EXPECT_EQ(fx.cfg.web_ui.font_size, "large");
+}
+
 TEST(WebServerHttp, UiPreferencesMessageAutoCollapseRollsBackOnSaveFailure) {
     WebServerFixture fx;
     std::filesystem::create_directories(fx.tmp_dir / "config.json");
@@ -13518,6 +13551,137 @@ TEST(WebServerHttp, DeleteBusyActiveSessionModelReturnsConflict) {
                            }),
               fx.cfg.saved_models.end());
     EXPECT_EQ(fx.cfg.default_model_name, "busy-fast");
+}
+
+// 场景:预设名含 `/`、`:`、空格、`+`、中文等会被前端 encodeURIComponent 转义的
+// 字符(如 OpenRouter / OpenAI 兼容模型 ID `poolside/laguna-xs.2:free`)。
+// 验证 PUT 更新、busy 删除保护、DELETE 删除以及非法百分号编码拒绝均正确工作。
+TEST(WebServerHttp, PutAndDeleteModelDecodePercentEncodedPathSegment) {
+    WebServerFixture fx;
+    const cpr::Header headers{{"Content-Type", "application/json"}};
+    const std::string original_name = "poolside/laguna-xs.2:free";
+    const std::string encoded_original = "poolside%2Flaguna-xs.2%3Afree";
+    const std::string renamed_name =
+        std::string("poolside/laguna-xs.2:free ") + u8"副本+1";
+    const std::string encoded_renamed =
+        "poolside%2Flaguna-xs.2%3Afree%20%E5%89%AF%E6%9C%AC%2B1";
+
+    auto added = cpr::Post(
+        cpr::Url{fx.url("/api/models")},
+        headers,
+        cpr::Body{json{
+            {"name", original_name},
+            {"provider", "openai"},
+            {"model", original_name},
+            {"base_url", "https://api.example.com/v1"},
+            {"api_key", "sk-special-1"},
+            {"context_window", 128000},
+        }.dump()});
+    ASSERT_EQ(added.status_code, 200) << added.text;
+
+    auto edited = cpr::Put(
+        cpr::Url{fx.url("/api/models/" + encoded_original)},
+        headers,
+        cpr::Body{json{
+            {"name", original_name},
+            {"provider", "openai"},
+            {"model", original_name},
+            {"base_url", "https://api.example.com/v1"},
+            {"context_window", 256000},
+        }.dump()});
+    ASSERT_EQ(edited.status_code, 200) << edited.text;
+    EXPECT_EQ(json::parse(edited.text)["context_window"], 256000);
+
+    auto renamed = cpr::Put(
+        cpr::Url{fx.url("/api/models/" + encoded_original)},
+        headers,
+        cpr::Body{json{
+            {"name", renamed_name},
+            {"provider", "openai"},
+            {"model", original_name},
+            {"base_url", "https://api.example.com/v1"},
+            {"context_window", 256000},
+        }.dump()});
+    ASSERT_EQ(renamed.status_code, 200) << renamed.text;
+    EXPECT_EQ(json::parse(renamed.text)["name"], renamed_name);
+
+    auto set_default = cpr::Post(
+        cpr::Url{fx.url("/api/config/default-model")},
+        headers,
+        cpr::Body{json{{"name", renamed_name}}.dump()});
+    ASSERT_EQ(set_default.status_code, 200) << set_default.text;
+    EXPECT_EQ(fx.cfg.default_model_name, renamed_name);
+
+    // 正在被 busy session 使用时,编码后的 DELETE 也必须命中 MODEL_IN_USE。
+    acecode::SessionOptions opts;
+    opts.model_name = renamed_name;
+    const std::string sid = fx.registry->create(opts);
+    auto entry = fx.registry->acquire(sid);
+    ASSERT_TRUE(entry);
+    auto blocker = std::make_shared<BlockingProvider>();
+    ASSERT_TRUE(entry->model_binding);
+    install_test_provider(*entry, blocker);
+    entry->loop->submit("hold encoded model");
+    ASSERT_TRUE(blocker->wait_for_started(2s));
+
+    auto blocked = cpr::Delete(cpr::Url{fx.url("/api/models/" + encoded_renamed)});
+    blocker->release();
+    for (int i = 0; i < 100 && entry->loop->is_busy(); ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    ASSERT_EQ(blocked.status_code, 409) << blocked.text;
+    EXPECT_EQ(json::parse(blocked.text)["error"], "MODEL_IN_USE");
+
+    auto removed = cpr::Delete(cpr::Url{fx.url("/api/models/" + encoded_renamed)});
+    ASSERT_EQ(removed.status_code, 200) << removed.text;
+    EXPECT_TRUE(fx.cfg.default_model_name.empty());
+    EXPECT_EQ(std::find_if(fx.cfg.saved_models.begin(),
+                           fx.cfg.saved_models.end(),
+                           [&](const acecode::ModelProfile& p) {
+                               return p.name == renamed_name;
+                           }),
+              fx.cfg.saved_models.end());
+}
+
+// 场景:路径段含非法百分号编码或 %00 时,PUT/DELETE /api/models/<name> 与
+// GET /api/models/catalog/<provider_id> 必须显式返回 400 BAD_REQUEST;
+// 合法编码的 catalog provider_id 应先解码再查询。
+TEST(WebServerHttp, ModelRoutesValidateAndDecodePercentEncodedSegments) {
+    const auto assets = acecode::test_support::find_repo_root(__FILE__) /
+        "assets" / "models_dev";
+    ScopedEnvOverride models_dir("ACECODE_MODELS_DEV_DIR", assets.string());
+    WebServerFixture fx;
+    acecode::initialize_registry(fx.cfg, "");
+    const cpr::Header headers{{"Content-Type", "application/json"}};
+
+    auto bad_delete_truncated = cpr::Delete(cpr::Url{fx.url("/api/models/bad%2")});
+    ASSERT_EQ(bad_delete_truncated.status_code, 400) << bad_delete_truncated.text;
+    EXPECT_EQ(json::parse(bad_delete_truncated.text)["error"], "BAD_REQUEST");
+
+    auto bad_delete_nul = cpr::Delete(cpr::Url{fx.url("/api/models/bad%00x")});
+    ASSERT_EQ(bad_delete_nul.status_code, 400) << bad_delete_nul.text;
+    EXPECT_EQ(json::parse(bad_delete_nul.text)["error"], "BAD_REQUEST");
+
+    auto bad_put = cpr::Put(
+        cpr::Url{fx.url("/api/models/bad%ZZ")},
+        headers,
+        cpr::Body{json{
+            {"name", "bad"},
+            {"provider", "copilot"},
+            {"model", "gpt-5"},
+        }.dump()});
+    ASSERT_EQ(bad_put.status_code, 400) << bad_put.text;
+    EXPECT_EQ(json::parse(bad_put.text)["error"], "BAD_REQUEST");
+
+    auto bad_catalog = cpr::Get(cpr::Url{fx.url("/api/models/catalog/bad%2")});
+    ASSERT_EQ(bad_catalog.status_code, 400) << bad_catalog.text;
+    EXPECT_EQ(json::parse(bad_catalog.text)["error"], "BAD_REQUEST");
+
+    // "open%72outer" 解码后为 "openrouter"。
+    auto encoded_catalog =
+        cpr::Get(cpr::Url{fx.url("/api/models/catalog/open%72outer?limit=1")});
+    ASSERT_EQ(encoded_catalog.status_code, 200) << encoded_catalog.text;
+    EXPECT_EQ(json::parse(encoded_catalog.text)["provider_id"], "openrouter");
 }
 
 // ---------------------------------------------------------------------

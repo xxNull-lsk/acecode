@@ -2742,8 +2742,6 @@ body {
   cursor: pointer;
   user-select: none;
 }
-.ace-sidebar-pinned-session-row:active,
-.ace-sidebar-workspace-session-row:active,
 .ace-sidebar-session-reordering .ace-sidebar-pinned-session-row,
 .ace-sidebar-session-reordering .ace-sidebar-workspace-session-row {
   cursor: grabbing;
@@ -5173,7 +5171,6 @@ a.ace-thread-link:focus-visible {
   cursor: pointer;
   user-select: none;
 }
-.ace-preview-details-tab:active,
 .ace-preview-tab-reordering .ace-preview-details-tab {
   cursor: grabbing;
 }
@@ -7925,27 +7922,6 @@ div.ace-markdown-opaque > div.ace-markdown-opaque-rendered {
 .ace-path-picker-soft-btn:disabled {
   opacity: 0.45;
   cursor: default;
-}
-.ace-path-picker-new-row {
-  display: grid;
-  grid-template-columns: 18px minmax(0, 360px);
-  gap: 0 12px;
-  align-items: center;
-  margin: 4px 6px 0;
-  padding: 3px 8px;
-  border-radius: 6px;
-  background: var(--ace-accent-bg);
-}
-.ace-path-picker-new-input {
-  height: 24px;
-  min-width: 0;
-  padding: 0 6px;
-  border: 1px solid var(--ace-accent);
-  border-radius: 4px;
-  background: var(--ace-surface);
-  color: var(--ace-fg);
-  font-size: 12.5px;
-  outline: none;
 }
 .ace-path-picker-crumbs {
   flex: 1;
