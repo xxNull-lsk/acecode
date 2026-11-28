@@ -2,6 +2,8 @@
 
 #include "session/session_storage.hpp"
 #include "session/session_usage_ledger.hpp"
+#include "session/session_tree_purge.hpp"
+#include "session/session_user_message_search.hpp"
 #include "share/invite_link.hpp"
 #include "team/team_invite.hpp"
 #include "team/repo_identity.hpp"
@@ -17,6 +19,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -82,6 +85,87 @@ std::optional<LocalSessionLocation> find_local_session_location(
     return std::nullopt;
 }
 
+struct LocalSessionFile {
+    std::string project_dir;
+    std::string meta_path;
+    SessionMeta meta;
+};
+
+// 按 session_id + team_id 定位本机会话(用于退出归档与删除级联)。
+std::optional<LocalSessionFile> find_local_team_session(
+    const std::string& team_id, const std::string& session_id) {
+    if (team_id.empty() || session_id.empty()) return std::nullopt;
+    std::error_code ec;
+    const fs::path projects = fs::path(get_acecode_dir()) / "projects";
+    if (!fs::exists(projects, ec)) return std::nullopt;
+    for (const auto& entry : fs::directory_iterator(projects, ec)) {
+        if (!entry.is_directory(ec)) continue;
+        const fs::path meta_path = entry.path() / (session_id + ".meta.json");
+        if (!fs::exists(meta_path, ec)) continue;
+        auto meta = SessionStorage::read_meta(path_to_utf8(meta_path));
+        if (meta.team_id != team_id) continue;
+        return LocalSessionFile{path_to_utf8(entry.path()), path_to_utf8(meta_path),
+                                std::move(meta)};
+    }
+    return std::nullopt;
+}
+
+// 退出团队:把本机该团队的会话标记为已归档。先释放内存中的会话实例,
+// 再重读磁盘 meta 写归档位(与普通会话归档同口径)。
+void archive_local_team_sessions(const team::TeamMeta& meta, SessionClient* client,
+                                 GlobalSessionSearchService* search) {
+    for (const auto& ref : meta.sessions) {
+        const auto found = find_local_team_session(meta.team_id, ref.session_id);
+        if (!found) continue;
+        if (client) {
+            client->destroy_session(ref.session_id);
+            for (const auto& info : client->list_sessions()) {
+                if (info.parent_session_id == ref.session_id)
+                    client->destroy_session(info.id);
+            }
+        }
+        auto latest = SessionStorage::read_meta(found->meta_path);
+        if (latest.id.empty()) latest = found->meta;
+        latest.archived = true;
+        if (!SessionStorage::write_meta(found->meta_path, latest)) {
+            LOG_WARN("[team] failed to archive local session " + ref.session_id);
+            continue;
+        }
+        if (search) {
+            const auto hash = path_to_utf8(path_from_utf8(found->project_dir).filename());
+            search->invalidate_project(hash);
+        }
+    }
+}
+
+// 删除归档团队时级联清掉本机该团队的会话树(含子会话、搜索索引、附件)。
+bool purge_local_team_sessions(const team::TeamMeta& meta, SessionClient* client,
+                               GlobalSessionSearchService* search, std::string* error) {
+    for (const auto& ref : meta.sessions) {
+        const auto found = find_local_team_session(meta.team_id, ref.session_id);
+        if (!found) continue;
+        // 用户可能在归档后主动恢复过某个会话:那不是归档副本,不再替用户删除。
+        if (!found->meta.archived) continue;
+        if (client) {
+            client->destroy_session(ref.session_id);
+            for (const auto& info : client->list_sessions()) {
+                if (info.parent_session_id == ref.session_id)
+                    client->destroy_session(info.id);
+            }
+        }
+        std::string purge_error;
+        if (!purge_session_tree(found->project_dir, ref.session_id, &purge_error)) {
+            if (error) *error = purge_error.empty() ? "session_purge_failed" : purge_error;
+            return false;
+        }
+        if (search) {
+            const auto hash = path_to_utf8(path_from_utf8(found->project_dir).filename());
+            search->invalidate_project(hash);
+        }
+    }
+    return true;
+}
+
 // 团队会话引用公开视图 + 本机定位投影(本机存在会话数据时补 cwd/hash)。
 nlohmann::json team_session_ref_with_local_info(const team::TeamSessionRef& ref) {
     auto j = web::team_session_ref_public_json(ref);
@@ -143,7 +227,7 @@ std::optional<team::DeviceQuotaStatus> WebServer::Impl::team_account_quota_statu
         quota = deps.app_config->team.account_daily_token_quota;
     }
     return team::account_quota_status(quota, team_service->data_dir(),
-                                      team_service->load_teams(),
+                                      team_service->load_teams(/*include_archived=*/true),
                                       team_service->now() * 1000);
 }
 
@@ -214,24 +298,28 @@ void WebServer::Impl::refresh_team_self_address(const std::string& team_id) {
     }
 }
 
-bool WebServer::Impl::deliver_team_message(const std::string& session_id,
+bool WebServer::Impl::deliver_team_message(const std::string& team_id,
+                                           const std::string& session_id,
                                            const team::TeamInboundMessage& message) {
     if (!deps.session_client) return false;
     const std::string labeled = team::TeamMessageRelay::labeled_text(message);
     if (deps.session_client->send_input(session_id, labeled, labeled)) return true;
-    // 会话不在 registry(daemon 重启过):先从磁盘恢复再投递。
+    // 会话不在 registry(daemon 重启过):先从磁盘恢复再投递。恢复会创建新的
+    // AgentLoop/dispatcher 实例,必须重挂团队订阅,否则这轮起的用量事件无人
+    // 入账,共享池当日已用停在上次的值。
     if (!deps.session_client->resume_session(session_id)) return false;
+    refresh_team_session_subscription(team_id, session_id);
     return deps.session_client->send_input(session_id, labeled, labeled);
 }
 
 std::shared_ptr<team::TeamMessageRelay> WebServer::Impl::team_relay_for(
-    const std::string& session_id) {
+    const std::string& team_id, const std::string& session_id) {
     std::lock_guard<std::mutex> lock(team_mu);
     auto& slot = team_relays[session_id];
     if (!slot) {
         slot = std::make_shared<team::TeamMessageRelay>(
-            [this, session_id](const team::TeamInboundMessage& inbound) {
-                return deliver_team_message(session_id, inbound);
+            [this, team_id, session_id](const team::TeamInboundMessage& inbound) {
+                return deliver_team_message(team_id, session_id, inbound);
             });
     }
     return slot;
@@ -303,7 +391,7 @@ void WebServer::Impl::forward_team_session_event(const std::string& team_id,
     if (!team_service) return;
     const std::int64_t now_ms = usage_now_unix_ms();
 
-    // 额度记账:Usage 事件按 UTC 日入账,记在 host(本机)头上。
+    // 额度记账:Usage 事件按本机时间日入账,记在 host(本机)头上。
     if (event.kind == SessionEventKind::Usage) {
         try {
             const auto& payload = event.payload;
@@ -324,7 +412,7 @@ void WebServer::Impl::forward_team_session_event(const std::string& team_id,
                 std::string error;
                 if (ledger.record(team_flag, usage, now_ms, &error)) {
                     (void)team_service->report_quota_usage(team_id, ledger.used_today(now_ms),
-                                                           now_ms / team::kQuotaDayMs);
+                                                           team::local_quota_day(now_ms));
                 }
             }
         } catch (const std::exception&) {}
@@ -396,9 +484,39 @@ void WebServer::Impl::ensure_team_session_subscriptions(const std::string& team_
             forward_team_session_event(team_id, session_id, event);
         };
         const auto sub = deps.session_client->subscribe(session_id, listener);
-        std::lock_guard<std::mutex> lock(team_mu);
-        team_session_subs[session_id] = sub;
+        // 订阅失败(会话未在本机 registry,subscribe 返回 0)不占位:后续
+        // ensure(resume / WS 重连)要能重试,否则断链的会话永远补不上。
+        if (sub == 0) continue;
+        bool stored = false;
+        {
+            std::lock_guard<std::mutex> lock(team_mu);
+            // 上面的存在性检查与 subscribe 之间没有持锁:WS 打开与 resume
+            // 重挂并发时可能都订阅成功。只保留先入表的一个,后到的立即
+            // 退订,否则同一 Usage 事件会被重复投递、重复记账。
+            if (team_session_subs.count(session_id) == 0) {
+                team_session_subs[session_id] = sub;
+                stored = true;
+            }
+        }
+        if (!stored) deps.session_client->unsubscribe(session_id, sub);
     }
+}
+
+// 会话经 resume 在本机 registry 重建后,原订阅指向的 dispatcher 实例已销毁:
+// 先退订旧订阅再走 ensure 重挂。旧 id 记录失败(0)时 unsubscribe 是 no-op。
+void WebServer::Impl::refresh_team_session_subscription(const std::string& team_id,
+                                                        const std::string& session_id) {
+    if (!team_service || !deps.session_client) return;
+    std::uint64_t stale = 0;
+    {
+        std::lock_guard<std::mutex> lock(team_mu);
+        if (const auto it = team_session_subs.find(session_id); it != team_session_subs.end()) {
+            stale = it->second;
+            team_session_subs.erase(it);
+        }
+    }
+    if (stale != 0) deps.session_client->unsubscribe(session_id, stale);
+    ensure_team_session_subscriptions(team_id);
 }
 
 // =====================================================================
@@ -444,15 +562,19 @@ void WebServer::Impl::register_team() {
             meta ? *meta : *created).dump());
     });
 
-    // 团队列表。
+    // 团队列表。默认只返回活跃团队;?archived=1 返回本机已退出的归档团队。
     CROW_ROUTE(app, "/api/team").methods(crow::HTTPMethod::GET)
     ([this](const crow::request& req) {
         if (auto denied = require_auth(req)) return std::move(*denied);
         if (!team_service) return team_error(req, 503, "team_unavailable");
-        for (const auto& meta : team_service->load_teams())
-            refresh_team_self_address(meta.team_id);
+        const bool archived = archived_query_requested(req);
+        const auto teams = archived ? team_service->load_archived_teams()
+                                    : team_service->load_teams();
+        if (!archived) {
+            for (const auto& meta : teams) refresh_team_self_address(meta.team_id);
+        }
         auto result = json::array();
-        for (const auto& meta : team_service->load_teams()) {
+        for (const auto& meta : teams) {
             team::QuotaLedger ledger(team_service->data_dir(), meta.team_id);
             const auto account_status = team_account_quota_status();
             auto state = web::team_state_json(meta, team_service->self().guid, ledger,
@@ -467,11 +589,13 @@ void WebServer::Impl::register_team() {
         return team_response(req, 200, json{{"teams", result}}.dump());
     });
 
-    // 单个团队状态。
+    // 单个团队状态。归档团队不再提供活跃详情。
     CROW_ROUTE(app, "/api/team/<string>").methods(crow::HTTPMethod::GET)
     ([this](const crow::request& req, const std::string& team_id) {
         if (auto denied = require_auth(req)) return std::move(*denied);
         if (!team_service) return team_error(req, 503, "team_unavailable");
+        if (team_service->is_team_archived(team_id))
+            return team_error(req, 404, "team_not_found");
         refresh_team_self_address(team_id);
         const auto meta = team_service->load_team(team_id);
         if (!meta) return team_error(req, 404, "team_not_found");
@@ -577,8 +701,9 @@ void WebServer::Impl::register_team() {
         } else if (local_repo) {
             (void)team_service->register_repo(invite.value.team_id, *local_repo);
         }
-        team::TeamLocalState local;
+        auto local = team_service->store_for(invite.value.team_id).load_local_state();
         local.work_dir = cwd;
+        local.archived_at = 0; // 重新加入时清除归档状态
         team_service->store_for(invite.value.team_id).save_local_state(local);
         broadcast_team_state(invite.value.team_id);
         return team_response(req, 200, json{{"team_id", invite.value.team_id}}.dump());
@@ -673,7 +798,7 @@ void WebServer::Impl::register_team() {
         if (!body.is_object() || !body.contains("cwd") || !body["cwd"].is_string() ||
             body["cwd"].get<std::string>().empty())
             return team_error(req, 400, "invalid_cwd");
-        team::TeamLocalState local;
+        auto local = team_service->store_for(team_id).load_local_state();
         local.work_dir = body["cwd"].get<std::string>();
         if (!team_service->store_for(team_id).save_local_state(local))
             return team_error(req, 500, "local_state_write_failed");
@@ -685,6 +810,111 @@ void WebServer::Impl::register_team() {
         }
         broadcast_team_state(team_id);
         return team_response(req, 200, json{{"work_dir", local.work_dir}}.dump());
+    });
+
+    // 退出团队:暂停本机 host 会话 → 尽力推送墓碑快照 → 归档本机会话与团队。
+    // 退出只影响本机与其他在线队员的成员列表;其他设备的团队副本各自管理。
+    CROW_ROUTE(app, "/api/team/<string>/leave").methods(crow::HTTPMethod::POST)
+    ([this](const crow::request& req, const std::string& team_id) {
+        if (auto denied = require_auth(req)) return std::move(*denied);
+        if (!team_service) return team_error(req, 503, "team_unavailable");
+        if (team_service->is_team_archived(team_id))
+            return team_error(req, 409, "already_archived");
+        const auto before = team_service->load_team(team_id);
+        if (!before) return team_error(req, 404, "team_not_found");
+
+        const auto left = team_service->leave_team(team_id);
+        if (!left) {
+            const int status = left.error == "not_member" || left.error == "already_left"
+                ? 409 : 500;
+            return team_error(req, status, left.error);
+        }
+
+        // 尽力通知在线队员:推送失败只记日志,不阻断本机退出。离线队员
+        // 下次从任一在线队员同步时通过墓碑收敛。并发推送,避免多个失联
+        // 地址把退出请求拖到逐地址超时。
+        const std::string credential =
+            team::derive_team_token(before->invite_seed, team_id);
+        if (!credential.empty()) {
+            const std::int64_t now = team_service->now();
+            const std::string path =
+                "/api/team/v1/state/push?team_id=" +
+                utils::percent_encode_query_component(team_id);
+            const nlohmann::json payload{{"snapshot", team::team_meta_to_json(left.snapshot)}};
+            std::vector<std::future<bool>> pushes;
+            for (const auto& member : left.snapshot.members) {
+                if (member.guid == team_service->self().guid || !team::member_active(member))
+                    continue;
+                if (now - member.last_seen > team::kMemberStaleSeconds) continue;
+                const auto colon = member.address.rfind(':');
+                if (colon == std::string::npos || colon == 0) continue;
+                const std::string host = member.address.substr(0, colon);
+                const int port = std::atoi(member.address.c_str() + colon + 1);
+                if (port <= 0 || port > 65535) continue;
+                pushes.push_back(std::async(std::launch::async,
+                    [host, port, path, payload, credential]() {
+                        const auto pushed = team::team_request(
+                            host, port, path, std::optional<std::string>{credential},
+                            std::optional<nlohmann::json>{payload});
+                        return pushed.error.empty() && pushed.status == 200;
+                    }));
+                if (pushes.size() >= 49) break;
+            }
+            for (auto& push : pushes) {
+                try {
+                    if (!push.get())
+                        LOG_WARN("[team] leave push failed for one online member");
+                } catch (const std::exception&) {
+                    LOG_WARN("[team] leave push threw for one online member");
+                }
+            }
+        }
+
+        // 本机不再订阅/中继该团队的会话。
+        for (const auto& ref : before->sessions) {
+            std::uint64_t sub = 0;
+            {
+                std::lock_guard<std::mutex> lock(team_mu);
+                if (const auto it = team_session_subs.find(ref.session_id);
+                    it != team_session_subs.end()) {
+                    sub = it->second;
+                    team_session_subs.erase(it);
+                }
+                team_relays.erase(ref.session_id);
+            }
+            if (sub != 0 && deps.session_client)
+                deps.session_client->unsubscribe(ref.session_id, sub);
+        }
+
+        // 团队会话自动归档(本机会话副本);远程 host 的会话没有本机数据。
+        archive_local_team_sessions(*before, deps.session_client,
+                                    global_session_search.get());
+        if (!team_service->archive_team(team_id))
+            return team_error(req, 500, "team_archive_failed");
+        return team_response(req, 200, json{{"ok", true}, {"archived", true}}.dump());
+    });
+
+    // 永久删除归档团队:只允许已退出归档的团队;级联删除本机会话副本。
+    CROW_ROUTE(app, "/api/team/<string>").methods(crow::HTTPMethod::Delete)
+    ([this](const crow::request& req, const std::string& team_id) {
+        if (auto denied = require_auth(req)) return std::move(*denied);
+        if (!team_service) return team_error(req, 503, "team_unavailable");
+        if (!team_service->is_team_archived(team_id))
+            return team_error(req, 409, "team_not_archived");
+        const auto meta = team_service->load_team(team_id);
+        if (!meta) return team_error(req, 404, "team_not_found");
+
+        std::string purge_error;
+        if (!purge_local_team_sessions(*meta, deps.session_client,
+                                       global_session_search.get(), &purge_error)) {
+            LOG_WARN("[team] delete archived team session purge failed: " + purge_error);
+            return team_error(req, 500, "session_delete_failed");
+        }
+        const auto deleted = team_service->delete_archived_team(team_id);
+        if (!deleted)
+            return team_error(req, 500,
+                              deleted.error.empty() ? "team_delete_failed" : deleted.error);
+        return team_response(req, 200, "{\"ok\":true}");
     });
 
     // 发起团队会话:创建本地会话 → 标记团队 meta → 登记 session_refs(host)。
@@ -777,7 +1007,7 @@ void WebServer::Impl::register_team() {
         // 在线源设备取数:按当前 host 成员记录的地址直连其 daemon。
         auto fetch = [this, team_id](const team::TeamMeta& meta,
                                      const team::TeamSessionRef& ref) -> team::SessionSourceData {
-            const team::TeamMember* host = team::find_member(meta, ref.host_guid);
+            const team::TeamMember* host = team::find_active_member(meta, ref.host_guid);
             std::string address = host ? host->address : std::string{};
             int port = 0;
             if (!address.empty()) {
@@ -825,7 +1055,9 @@ void WebServer::Impl::register_team() {
         const auto outcome = takeover.take_over(team_id, session_id, cwd,
             SessionStorage::get_project_dir(cwd));
         if (!outcome) return team_error(req, 409, outcome.error);
-        ensure_team_session_subscriptions(team_id);
+        // take_over 内部可能 resume 重建 dispatcher:按会话重挂,不能只走
+        // ensure(旧订阅 id 还在表里时 ensure 会跳过,用量再次断链)。
+        refresh_team_session_subscription(team_id, session_id);
         broadcast_team_state(team_id);
         broadcast_team_session_event(team_id, "host_changed", outcome.ref);
         return team_response(req, 200,
@@ -858,7 +1090,7 @@ void WebServer::Impl::register_team() {
             message.sender_guid = team_service->self().guid;
             message.sender_name = utils::current_account_name();
             message.text = text;
-            const auto relay = team_relay_for(session_id);
+            const auto relay = team_relay_for(team_id, session_id);
             const auto outcome =
                 relay->receive(std::move(message), local_session_busy(deps.session_client, session_id));
             if (outcome == team::RelayOutcome::Rejected) return team_error(req, 400, "invalid_message");
@@ -868,7 +1100,7 @@ void WebServer::Impl::register_team() {
 
         // 转发到 host 设备(队员视角,消息标注本机账户名)。
         refresh_team_self_address(team_id);
-        const team::TeamMember* host = team::find_member(*meta, ref->host_guid);
+        const team::TeamMember* host = team::find_active_member(*meta, ref->host_guid);
         std::string address = host ? host->address : std::string{};
         int port = 0;
         if (!address.empty()) {
@@ -992,7 +1224,7 @@ void WebServer::Impl::register_team_member_routes() {
         message.text = text;
         message.received_at_ms = now_unix_ms();
 
-        const auto relay = team_relay_for(session_id);
+        const auto relay = team_relay_for(team_id, session_id);
         const bool busy = local_session_busy(deps.session_client, session_id);
         const auto outcome = relay->receive(std::move(message), busy);
         if (outcome == team::RelayOutcome::Rejected)

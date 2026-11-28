@@ -103,7 +103,7 @@ SnapshotFetcher make_network_join_fetcher(const DeviceIdentity& self) {
                     last_error = "team_id_mismatch";
                     continue;
                 }
-                if (!find_member(snapshot, self.guid)) {
+                if (!find_active_member(snapshot, self.guid)) {
                     last_error = "self_not_in_team";
                     continue;
                 }

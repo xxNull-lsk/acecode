@@ -57,6 +57,8 @@ function TeamSettingsDetail({ teamId, onBack }) {
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
   const [takeoverTarget, setTakeoverTarget] = useState(null); // { teamId, sessionId }
   const [notice, setNotice] = useState(null); // { text, tone }
+  const [leaveOpen, setLeaveOpen] = useState(false);
+  const [leaving, setLeaving] = useState(false);
   const wsRef = useRef(null);
 
   const activeTeam = useMemo(
@@ -256,6 +258,22 @@ function TeamSettingsDetail({ teamId, onBack }) {
       toast({ kind: 'err', text: errText(e) });
     } finally {
       setBusy('');
+    }
+  };
+
+  const confirmLeave = async () => {
+    if (!activeTeam || leaving) return;
+    setLeaving(true);
+    try {
+      await api.leaveTeam(activeTeam.team_id);
+      toast({ kind: 'ok', text: '已退出团队，团队信息与会话已归档' });
+      window.dispatchEvent(new CustomEvent('acecode:teams-changed'));
+      setLeaveOpen(false);
+      onBack();
+    } catch (e) {
+      toast({ kind: 'err', text: errText(e) });
+    } finally {
+      setLeaving(false);
     }
   };
 
@@ -490,7 +508,45 @@ function TeamSettingsDetail({ teamId, onBack }) {
             onClick={startSession}
             className="mt-1 px-3 py-1 bg-accent text-white rounded disabled:opacity-60"
           >发起团队会话</button>
+
+          <div className="mt-6 pt-4 border-t border-border max-w-xl">
+            <button
+              type="button"
+              onClick={() => setLeaveOpen(true)}
+              className="text-[12px] text-danger hover:underline"
+            >退出团队</button>
+          </div>
         </>
+      )}
+
+      {leaveOpen && (
+        <Modal
+          onClose={() => !leaving && setLeaveOpen(false)}
+          dismissOnBackdrop={!leaving}
+          dismissOnEscape={!leaving}
+          labelledBy="team-leave-title"
+        >
+          <div className="p-5 max-w-[26rem]">
+            <h3 id="team-leave-title" className="text-[15px] font-semibold text-fg">退出团队</h3>
+            <p className="mt-2 text-[12px] leading-5 text-fg-2">
+              退出后本机团队会话和团队信息会进入归档，其他队员仍保留该团队。归档后可以直接删除本机这份团队数据。
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={leaving}
+                onClick={() => setLeaveOpen(false)}
+                className="h-8 rounded-md border border-border px-3 text-[12px] text-fg-2 hover:bg-surface-hi disabled:opacity-50"
+              >取消</button>
+              <button
+                type="button"
+                disabled={leaving}
+                onClick={confirmLeave}
+                className="h-8 rounded-md bg-danger px-3 text-[12px] font-medium text-white hover:opacity-90 disabled:opacity-50"
+              >{leaving ? '退出中…' : '退出团队'}</button>
+            </div>
+          </div>
+        </Modal>
       )}
 
       {/* 手动接管目标选择:在线 + 有剩余额度的队员 */}
@@ -553,14 +609,17 @@ export function TeamSettings() {
 }
 
 function TeamSettingsRoot({ onOpenTeam }) {
-  const [config, setConfig] = useState(null); // { enabled, account_daily_token_quota }
+  const [config, setConfig] = useState(null); // { enabled, account_daily_token_quota, account_quota_used_today }
   const [configLoading, setConfigLoading] = useState(true);
   const [teams, setTeams] = useState([]);
+  const [archivedTeams, setArchivedTeams] = useState([]);
   const [teamsLoading, setTeamsLoading] = useState(true);
   const [saving, setSaving] = useState(''); // 'enabled' | 'quota'
   const [quotaDraft, setQuotaDraft] = useState(null); // 百万 tokens 字符串草稿
   const [createOpen, setCreateOpen] = useState(false);
   const [joinOpen, setJoinOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState(null); // 归档团队
+  const [deleting, setDeleting] = useState(false);
   const enabled = config?.enabled === true;
 
   const load = useCallback(async () => {
@@ -569,6 +628,7 @@ function TeamSettingsRoot({ onOpenTeam }) {
       setConfig({
         enabled: result?.enabled === true,
         account_daily_token_quota: Number(result?.account_daily_token_quota ?? 0),
+        account_quota_used_today: Number(result?.account_quota_used_today ?? 0),
       });
     } catch (e) {
       toast({ kind: 'err', text: errText(e) });
@@ -579,6 +639,10 @@ function TeamSettingsRoot({ onOpenTeam }) {
       const result = await api.listTeams();
       setTeams(Array.isArray(result?.teams) ? result.teams : []);
     } catch { /* 功能未开或暂不可用:列表为空 */ }
+    try {
+      const result = await api.listArchivedTeams();
+      setArchivedTeams(Array.isArray(result?.teams) ? result.teams : []);
+    } catch { setArchivedTeams([]); }
     finally {
       setTeamsLoading(false);
     }
@@ -607,10 +671,11 @@ function TeamSettingsRoot({ onOpenTeam }) {
     setSaving('enabled');
     try {
       const result = await api.setTeamConfig({ enabled: next });
-      setConfig({
+      setConfig((prev) => ({
+        ...prev,
         enabled: result?.enabled === true,
-        account_daily_token_quota: Number(result?.account_daily_token_quota ?? previous?.account_daily_token_quota ?? 0),
-      });
+        account_daily_token_quota: Number(result?.account_daily_token_quota ?? prev?.account_daily_token_quota ?? 0),
+      }));
       notifyTeamConfigChanged();
     } catch (e) {
       setConfig(previous);
@@ -649,6 +714,22 @@ function TeamSettingsRoot({ onOpenTeam }) {
     onOpenTeam(meta.team_id);
   };
 
+  const confirmDeleteArchived = async () => {
+    if (!deleteTarget || deleting) return;
+    setDeleting(true);
+    try {
+      await api.deleteTeam(deleteTarget.team_id);
+      setArchivedTeams((prev) => prev.filter((team) => team.team_id !== deleteTarget.team_id));
+      setDeleteTarget(null);
+      window.dispatchEvent(new CustomEvent('acecode:teams-changed'));
+      toast({ kind: 'ok', text: `已删除“${deleteTarget.name || deleteTarget.team_id}”` });
+    } catch (e) {
+      toast({ kind: 'err', text: errText(e) });
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   return (
     <div className="flex-1 overflow-y-auto px-12 py-6">
       <h2 className="text-xl font-bold mb-5">团队</h2>
@@ -674,25 +755,30 @@ function TeamSettingsRoot({ onOpenTeam }) {
               <div className="flex items-center justify-between px-3.5 py-2.5 rounded-md bg-surface border border-border mb-2">
                 <div>
                   <div className="text-[13px] text-fg">每日 token 额度</div>
-                  <div className="text-[11px] text-fg-mute mt-0.5">本机账号所有团队共享,UTC 日重置</div>
+                  <div className="text-[11px] text-fg-mute mt-0.5">
+                    本机账号所有团队共享,按本机时间重置 · 已用 {quotaUsedText(config.account_quota_used_today)}
+                  </div>
                 </div>
-                <input
-                  type="number"
-                  min="0"
-                  value={quotaDraft ?? (config.account_daily_token_quota ?? 0) / QUOTA_MILLION}
-                  onChange={(e) => setQuotaDraft(e.target.value)}
-                  onBlur={saveQuota}
-                  onKeyDown={(e) => { if (e.key === 'Enter') saveQuota(); }}
-                  aria-label="每日 token 额度(百万 tokens)"
-                  disabled={saving === 'quota'}
-                  className="w-24 h-7 px-2 text-[12px] text-center rounded-md border border-border bg-surface-alt text-fg outline-none focus:border-accent transition"
-                />
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="number"
+                    min="0"
+                    value={quotaDraft ?? (config.account_daily_token_quota ?? 0) / QUOTA_MILLION}
+                    onChange={(e) => setQuotaDraft(e.target.value)}
+                    onBlur={saveQuota}
+                    onKeyDown={(e) => { if (e.key === 'Enter') saveQuota(); }}
+                    aria-label="每日 token 额度(百万 tokens)"
+                    disabled={saving === 'quota'}
+                    className="w-20 h-7 px-2 text-[12px] text-center rounded-md border border-border bg-surface-alt text-fg outline-none focus:border-accent transition"
+                  />
+                  <span className="text-[12px] text-fg-mute">M</span>
+                </div>
               </div>
 
               {/* 3. 团队列表:点行进入该团队的二级设置 */}
               <div className="text-[14px] font-semibold mt-4 mb-2">团队列表</div>
               {teamsLoading && <div className="text-[13px] text-fg-mute mb-2">加载中…</div>}
-              {!teamsLoading && teams.length === 0 && (
+              {!teamsLoading && teams.length === 0 && archivedTeams.length === 0 && (
                 <div className="px-3.5 py-2.5 rounded-md bg-surface border border-border mb-2 text-[13px] text-fg-mute">
                   还没有团队。
                 </div>
@@ -721,6 +807,36 @@ function TeamSettingsRoot({ onOpenTeam }) {
                 </div>
               ))}
 
+              {archivedTeams.length > 0 && (
+                <>
+                  <div className="text-[14px] font-semibold mt-4 mb-2">已归档团队</div>
+                  {archivedTeams.map((team) => {
+                    const archivedAt = team.local?.archived_at
+                      ? new Date(team.local.archived_at * 1000).toLocaleDateString()
+                      : '';
+                    return (
+                      <div
+                        key={team.team_id}
+                        className="flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-md bg-surface border border-border mb-2"
+                      >
+                        <div className="min-w-0">
+                          <div className="text-[13px] text-fg truncate">{team.name || team.team_id}</div>
+                          <div className="text-[11px] text-fg-mute mt-0.5">
+                            {(team.members || []).length} 名成员 · {(team.sessions || []).length} 个团队会话
+                            {archivedAt ? ` · 归档于 ${archivedAt}` : ''}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setDeleteTarget(team)}
+                          className="px-2 py-0.5 text-[11px] text-danger hover:underline shrink-0"
+                        >删除</button>
+                      </div>
+                    );
+                  })}
+                </>
+              )}
+
               <div className="flex items-center gap-2 mt-3">
                 <button
                   type="button"
@@ -743,6 +859,37 @@ function TeamSettingsRoot({ onOpenTeam }) {
       )}
       {joinOpen && (
         <TeamJoinModal onClose={() => setJoinOpen(false)} onJoined={notifyTeamConfigChanged} />
+      )}
+      {deleteTarget && (
+        <Modal
+          onClose={() => !deleting && setDeleteTarget(null)}
+          dismissOnBackdrop={!deleting}
+          dismissOnEscape={!deleting}
+          labelledBy="team-archive-delete-title"
+        >
+          <div className="p-5 max-w-[26rem]">
+            <h3 id="team-archive-delete-title" className="text-[15px] font-semibold text-fg">
+              删除已归档团队
+            </h3>
+            <p className="mt-2 text-[12px] leading-5 text-fg-2">
+              将永久删除“{deleteTarget.name || deleteTarget.team_id}”的团队信息和本机归档的团队会话，其他设备不受影响。
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={deleting}
+                onClick={() => setDeleteTarget(null)}
+                className="h-8 rounded-md border border-border px-3 text-[12px] text-fg-2 hover:bg-surface-hi disabled:opacity-50"
+              >取消</button>
+              <button
+                type="button"
+                disabled={deleting}
+                onClick={confirmDeleteArchived}
+                className="h-8 rounded-md bg-danger px-3 text-[12px] font-medium text-white hover:opacity-90 disabled:opacity-50"
+              >{deleting ? '删除中…' : '删除'}</button>
+            </div>
+          </div>
+        </Modal>
       )}
     </div>
   );

@@ -3667,6 +3667,7 @@ function UsageEmptyState({ text }) {
 
 function SectionUsage() {
   const [raw, setRaw] = useState(null);
+  const [teamPool, setTeamPool] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [reloadKey, setReloadKey] = useState(0);
@@ -3685,6 +3686,23 @@ function SectionUsage() {
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
+    api.getTeamConfig()
+      .then((data) => {
+        if (cancelled) return;
+        setTeamPool(data?.enabled === true
+          ? {
+              quota: Number(data.account_daily_token_quota ?? 0),
+              used: Number(data.account_quota_used_today ?? 0),
+              teams: (Array.isArray(data.account_quota_teams) ? data.account_quota_teams : [])
+                .map((t) => ({
+                  teamId: String(t?.team_id ?? ''),
+                  name: String(t?.name ?? ''),
+                  used: Number(t?.used_today ?? 0),
+                })),
+            }
+          : null);
+      })
+      .catch(() => { if (!cancelled) setTeamPool(null); });
     return () => { cancelled = true; };
   }, [reloadKey]);
 
@@ -3841,6 +3859,32 @@ function SectionUsage() {
           </div>
         </>
       ))}
+
+      {teamPool && teamPool.teams.length > 0 && (
+        <div className="mb-6">
+          <div className="text-[14px] font-semibold mb-3">团队共享池当日消耗</div>
+          <div className="rounded-md bg-surface border border-border overflow-hidden">
+            {teamPool.teams.map((t, i) => (
+              <div
+                key={t.teamId || i}
+                className={clsx(
+                  'flex items-center justify-between gap-3 px-4 py-3',
+                  i < teamPool.teams.length - 1 && 'border-b border-border',
+                )}
+              >
+                <div className="text-[13px] truncate">{t.name || t.teamId}</div>
+                <div className="text-[13px] shrink-0">{formatUsageTokens(t.used)}</div>
+              </div>
+            ))}
+            <div className="flex items-center justify-between gap-3 px-4 py-3 border-t border-border">
+              <div className="text-[13px] text-fg-mute shrink-0">已用</div>
+              <div className="text-[13px]">
+                {formatUsageTokens(teamPool.used)} / {formatUsageTokens(teamPool.quota)}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

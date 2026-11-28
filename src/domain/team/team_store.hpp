@@ -40,7 +40,8 @@ struct InviteLedgerLoad {
 
 // 本机团队状态:各设备本地路径不同,绝不进 TeamMeta 同步链路。
 struct TeamLocalState {
-    std::string work_dir;  // 本机团队工作目录;空 = 未设置
+    std::string work_dir;         // 本机团队工作目录;空 = 未设置
+    std::int64_t archived_at = 0; // 退出后的归档时间(秒);0 = 活跃
 };
 
 class TeamStore {

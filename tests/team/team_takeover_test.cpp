@@ -131,6 +131,10 @@ TEST(TeamTakeover, TargetEligibility) {
     TeamMeta exhausted = meta;
     find_member(exhausted, "guid-b")->daily_token_quota = 0; // 0 = 当日不承接
     EXPECT_EQ(check_takeover_target(exhausted, "guid-b", now).error, "quota_exhausted");
+
+    TeamMeta left = meta;
+    find_member(left, "guid-b")->left_at = now;
+    EXPECT_EQ(check_takeover_target(left, "guid-b", now).error, "member_not_found");
 }
 
 // 5.2 场景: 源失联 → 用最近副本接管成功,视图指向新 host;resume 被调用
@@ -149,7 +153,7 @@ TEST(TeamTakeover, OfflineTakeoverFromReplica) {
     meta.sessions.push_back({"s-1", "会话", "guid-a", "paused", "失联", "guid-a", 1, 1});
     // A 的最后已知快照:用量未超
     find_member(meta, "guid-a")->quota_used_today = 1'000'000;
-    find_member(meta, "guid-a")->quota_day = clock.now * 1000 / kQuotaDayMs;
+    find_member(meta, "guid-a")->quota_day = local_quota_day(clock.now * 1000);
     ASSERT_TRUE(TeamStore(temp.utf8(), "team-1").save_meta(meta));
 
     // 本机最近副本(host 同步落下的:源 jsonl/meta 为空内容 + 源 HEAD)

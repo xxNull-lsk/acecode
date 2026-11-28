@@ -38,7 +38,7 @@ TakeoverTargetCheck check_takeover_target(const TeamMeta& meta, const std::strin
                                           std::int64_t now_seconds) {
     TakeoverTargetCheck result;
     const TeamMember* member = find_member(meta, target_guid);
-    if (!member) {
+    if (!member || !member_active(*member)) {
         result.error = "member_not_found";
         return result;
     }

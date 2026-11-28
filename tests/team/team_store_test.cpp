@@ -156,12 +156,14 @@ TEST(TeamStore, LocalStateRoundTrip) {
 
     TeamLocalState state;
     state.work_dir = "/home/a/projects/demo";
+    state.archived_at = 1'700'000'000;
     ASSERT_TRUE(store.save_local_state(state));
 
     const fs::path expected = temp.root / "team" / "team-1" / "local.json";
     EXPECT_TRUE(fs::exists(expected));
     const TeamLocalState loaded = store.load_local_state();
     EXPECT_EQ(loaded.work_dir, "/home/a/projects/demo");
+    EXPECT_EQ(loaded.archived_at, 1'700'000'000);
 
     // 覆盖写生效
     TeamLocalState next;
@@ -172,6 +174,7 @@ TEST(TeamStore, LocalStateRoundTrip) {
     // 空 work_dir 序列化为不带字段的对象,读回仍是空
     ASSERT_TRUE(store.save_local_state(TeamLocalState{}));
     EXPECT_TRUE(store.load_local_state().work_dir.empty());
+    EXPECT_EQ(store.load_local_state().archived_at, 0);
 }
 
 // 场景: local.json 损坏 → 按"未设置"处理,不抛异常

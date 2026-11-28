@@ -57,8 +57,10 @@ nlohmann::json team_state_json(const team::TeamMeta& meta,
                                const team::DeviceQuotaStatus* account_status) {
     nlohmann::json j = team_meta_public_json(meta);
     auto members = nlohmann::json::array();
-    for (const auto& member : meta.members)
+    for (const auto& member : meta.members) {
+        if (!team::member_active(member)) continue;
         members.push_back(team_member_public_json(meta, member, now_seconds));
+    }
     j["members"] = members;
     auto sessions = nlohmann::json::array();
     for (const auto& ref : meta.sessions)
@@ -76,8 +78,12 @@ nlohmann::json team_state_json(const team::TeamMeta& meta,
         {"quota_used_today", self_status.used},
         {"quota_exhausted", self_status.exhausted()},
     };
-    // 本机团队状态:工作目录(每设备本地状态,调用方决定是否下发到别的设备)。
-    if (!local.work_dir.empty()) j["local"] = {{"work_dir", local.work_dir}};
+    // 本机团队状态:工作目录与归档时间(每设备本地状态,调用方决定是否下发
+    // 到别的设备)。
+    nlohmann::json local_json = nlohmann::json::object();
+    if (!local.work_dir.empty()) local_json["work_dir"] = local.work_dir;
+    if (local.archived_at != 0) local_json["archived_at"] = local.archived_at;
+    if (!local_json.empty()) j["local"] = std::move(local_json);
     return j;
 }
 

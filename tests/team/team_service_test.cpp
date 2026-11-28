@@ -351,3 +351,195 @@ TEST(TeamService, RegisterRepoIsIdempotent) {
     EXPECT_EQ(service.register_repo(meta->team_id, RepoIdentity{}).error, "invalid_repo");
     EXPECT_EQ(service.register_repo("nope", RepoIdentity{"remote", "x"}).error, "team_not_found");
 }
+
+namespace {
+
+TeamMember make_member(const std::string& guid, const std::string& role,
+                       std::int64_t joined_at) {
+    TeamMember member;
+    member.guid = guid;
+    member.account = guid + "@pc";
+    member.role = role;
+    member.joined_at = joined_at;
+    member.last_seen = joined_at;
+    member.updated_at = joined_at;
+    member.updated_by = guid;
+    return member;
+}
+
+TeamSessionRef make_session(const std::string& id, const std::string& host_guid,
+                            std::int64_t updated_at) {
+    TeamSessionRef ref;
+    ref.session_id = id;
+    ref.title = id;
+    ref.host_guid = host_guid;
+    ref.state = std::string(kSessionStateRunning);
+    ref.created_by = host_guid;
+    ref.created_at = updated_at;
+    ref.updated_at = updated_at;
+    return ref;
+}
+
+} // namespace
+
+// 退出场景: 暂停本机 host 会话、写墓碑、最后管理员自动转让给最早加入者
+TEST(TeamService, LeavePausesHostedSessionsAndTransfersAdmin) {
+    TempDir temp;
+    Clock clock;
+    TeamService service(temp.utf8(), identity("guid-a"), [&] { return clock.now; });
+    std::string error;
+    auto meta = service.create_team("组", &error);
+    ASSERT_TRUE(meta.has_value());
+    meta->members.push_back(make_member("guid-c", "member", clock.now + 20));
+    meta->members.push_back(make_member("guid-b", "member", clock.now + 10));
+    meta->sessions.push_back(make_session("s-local", "guid-a", clock.now));
+    meta->sessions.push_back(make_session("s-remote", "guid-b", clock.now));
+    ASSERT_TRUE(TeamStore(temp.utf8(), meta->team_id).save_meta(*meta));
+
+    clock.now += 100;
+    const auto left = service.leave_team(meta->team_id);
+    ASSERT_TRUE(left) << left.error;
+    ASSERT_EQ(left.paused_sessions.size(), 1u);
+    EXPECT_EQ(left.paused_sessions[0], "s-local");
+    EXPECT_EQ(left.promoted_guid, "guid-b"); // joined_at 更早
+
+    const auto self = find_member(left.snapshot, "guid-a");
+    ASSERT_TRUE(self);
+    EXPECT_FALSE(member_active(*self));
+    EXPECT_EQ(self->left_at, clock.now);
+    EXPECT_EQ(self->role, "member");
+    EXPECT_EQ(find_member(left.snapshot, "guid-b")->role, "admin");
+    EXPECT_EQ(find_member(left.snapshot, "guid-c")->role, "member");
+
+    const auto* local_ref = find_session(left.snapshot, "s-local");
+    ASSERT_TRUE(local_ref);
+    EXPECT_EQ(local_ref->state, "paused");
+    EXPECT_EQ(local_ref->pause_reason, "设备已退出");
+    EXPECT_EQ(find_session(left.snapshot, "s-remote")->state, "running");
+
+    // 退出不等于归档: 团队仍在活跃列表里,直到调用方完成本地归档。
+    EXPECT_EQ(service.load_teams().size(), 1u);
+    EXPECT_TRUE(service.archive_team(meta->team_id));
+    EXPECT_TRUE(service.load_teams().empty());
+    auto archived = service.load_archived_teams();
+    ASSERT_EQ(archived.size(), 1u);
+    EXPECT_TRUE(archived[0].invite_seed.empty()); // 不再持有团队凭据
+    EXPECT_TRUE(service.load_team(meta->team_id)->invite_seed.empty());
+}
+
+// 退出场景: 团队还有其他管理员时不再提升普通成员
+TEST(TeamService, LeaveDoesNotPromoteWhenAnotherAdminExists) {
+    TempDir temp;
+    Clock clock;
+    TeamService service(temp.utf8(), identity("guid-a"), [&] { return clock.now; });
+    std::string error;
+    auto meta = service.create_team("组", &error);
+    ASSERT_TRUE(meta.has_value());
+    meta->members.push_back(make_member("guid-b", "admin", clock.now + 10));
+    meta->members.push_back(make_member("guid-c", "member", clock.now + 20));
+    ASSERT_TRUE(TeamStore(temp.utf8(), meta->team_id).save_meta(*meta));
+
+    clock.now += 100;
+    const auto left = service.leave_team(meta->team_id);
+    ASSERT_TRUE(left) << left.error;
+    EXPECT_TRUE(left.promoted_guid.empty());
+    EXPECT_EQ(find_member(left.snapshot, "guid-b")->role, "admin");
+    EXPECT_EQ(find_member(left.snapshot, "guid-c")->role, "member");
+}
+
+// 退出场景: 非成员与重复退出被拒;活跃团队不能被直接删除
+TEST(TeamService, LeaveRequiresActiveMemberAndDeleteRequiresArchive) {
+    TempDir temp;
+    Clock clock;
+    TeamService service(temp.utf8(), identity("guid-a"), [&] { return clock.now; });
+    std::string error;
+    const auto meta = service.create_team("组", &error);
+    ASSERT_TRUE(meta.has_value());
+
+    EXPECT_EQ(service.delete_archived_team(meta->team_id).error, "team_not_archived");
+    ASSERT_TRUE(service.leave_team(meta->team_id));
+    EXPECT_TRUE(service.leave_team(meta->team_id)); // 幂等:可继续完成归档
+    EXPECT_TRUE(service.archive_team(meta->team_id));
+
+    TempDir other_dir;
+    TeamService other(other_dir.utf8(), identity("guid-x"), [&] { return clock.now; });
+    EXPECT_EQ(other.leave_team(meta->team_id).error, "team_not_found");
+    EXPECT_TRUE(service.delete_archived_team(meta->team_id));
+    EXPECT_FALSE(service.load_team(meta->team_id).has_value());
+    EXPECT_TRUE(service.load_archived_teams().empty());
+}
+
+// 退出同步场景: 墓碑经 LWW 收敛;重新加入复用原成员记录
+TEST(TeamService, LeaveTombstoneMergesAndRejoinReactivatesMember) {
+    TempDir a_dir;
+    TempDir b_dir;
+    Clock clock;
+    TeamService a(a_dir.utf8(), identity("guid-a"), [&] { return clock.now; });
+    std::string error;
+    const auto created = a.create_team("组", &error);
+    ASSERT_TRUE(created.has_value());
+    auto with_b = *created;
+    with_b.members.push_back(make_member("guid-b", "member", clock.now + 10));
+    ASSERT_TRUE(TeamStore(a_dir.utf8(), created->team_id).save_meta(with_b));
+
+    TeamService b(b_dir.utf8(), identity("guid-b"), [&] { return clock.now; });
+    ASSERT_TRUE(b.apply_snapshot(with_b));
+
+    clock.now += 100;
+    const auto left = a.leave_team(created->team_id);
+    ASSERT_TRUE(left) << left.error;
+    // B 收到退出快照后把 A 视为已退出,但保留墓碑记录。
+    const auto merged = b.merge_remote(created->team_id, left.snapshot, &error);
+    ASSERT_TRUE(merged.has_value()) << error;
+    ASSERT_TRUE(find_member(*merged, "guid-a"));
+    EXPECT_FALSE(member_active(*find_member(*merged, "guid-a")));
+    EXPECT_TRUE(is_admin(*find_member(*merged, "guid-b")));
+
+    // B 现在是管理员,签发邀请码后 A 用同一 GUID 重新加入。
+    const auto issued = b.issue_invite(created->team_id, {"127.0.0.1"}, 12399);
+    ASSERT_TRUE(issued) << issued.error;
+    const auto rejoined = b.accept_join(created->team_id, issued.invite.token,
+                                        identity("guid-a", "alice@a-pc"));
+    ASSERT_TRUE(rejoined) << rejoined.error;
+    EXPECT_EQ(rejoined.snapshot.members.size(), 2u); // 不产生重复成员
+    const auto* a_member = find_member(rejoined.snapshot, "guid-a");
+    ASSERT_TRUE(a_member);
+    EXPECT_TRUE(member_active(*a_member));
+    EXPECT_EQ(a_member->left_at, 0);
+    EXPECT_EQ(a_member->role, "member");
+    EXPECT_EQ(a_member->account, "alice@a-pc");
+}
+
+// 退出后本地团队状态归档;重新加入时清掉归档状态
+TEST(TeamService, RejoinClearsLocalArchiveState) {
+    TempDir temp;
+    Clock clock;
+    TeamService service(temp.utf8(), identity("guid-a"), [&] { return clock.now; });
+    std::string error;
+    const auto meta = service.create_team("组", &error);
+    ASSERT_TRUE(meta.has_value());
+    ASSERT_TRUE(service.leave_team(meta->team_id));
+    ASSERT_TRUE(service.archive_team(meta->team_id));
+    EXPECT_TRUE(service.is_team_archived(meta->team_id));
+
+    ASSERT_TRUE(service.apply_snapshot(*service.load_team(meta->team_id)));
+    EXPECT_FALSE(service.is_team_archived(meta->team_id));
+}
+
+// 退出场景: 旧数据 joined_at=0 视为更早加入,优先于带时间戳的新成员
+TEST(TeamService, LeavePromotesLegacyMemberBeforeNewerJoin) {
+    TempDir temp;
+    Clock clock;
+    TeamService service(temp.utf8(), identity("guid-a"), [&] { return clock.now; });
+    std::string error;
+    auto meta = service.create_team("组", &error);
+    ASSERT_TRUE(meta.has_value());
+    meta->members.push_back(make_member("guid-legacy", "member", 0));
+    meta->members.push_back(make_member("guid-new", "member", clock.now + 10));
+    ASSERT_TRUE(TeamStore(temp.utf8(), meta->team_id).save_meta(*meta));
+
+    clock.now += 100;
+    const auto left = service.leave_team(meta->team_id);
+    ASSERT_TRUE(left) << left.error;
+    EXPECT_EQ(left.promoted_guid, "guid-legacy");
+}

@@ -19,10 +19,10 @@ inline constexpr int kMaxConcurrentTeamSessions = 5;
 inline constexpr std::string_view kRoleAdmin = "admin";
 inline constexpr std::string_view kRoleMember = "member";
 
-// 每日贡献额度默认值(spec team-token-quota):每设备 30M LLM tokens/UTC 日。
+// 每日贡献额度默认值(spec team-token-quota):每设备 30M LLM tokens/本机时间日。
 // 0 = 该设备当日不承接任何团队会话。
 inline constexpr std::int64_t kDefaultDailyQuotaTokens = 30'000'000;
-// UTC 日索引的时间粒度(与 usage ledger 的日分桶一致)。
+// 日索引的时间粒度(与 usage ledger 的日分桶一致;日界按设备本机时区)。
 inline constexpr std::int64_t kQuotaDayMs = 86'400'000;
 
 // 会话状态:running 正常;paused 等待手动接管(reason 标注失联/额度/异常);
@@ -38,13 +38,15 @@ struct TeamMember {
     std::string role;          // kRoleAdmin / kRoleMember
     std::string address;       // 最近已知地址(host:port);离线也保留
     std::int64_t last_seen = 0;
+    std::int64_t joined_at = 0; // 加入时间(秒);旧数据为 0,按列表顺序回退
+    std::int64_t left_at = 0;   // 退出时间(秒);0 = 活跃,非 0 = 退出墓碑
     std::int64_t updated_at = 0;
     std::string updated_by;    // 修改该记录的设备 GUID
 
     // 每日贡献额度(spec team-token-quota):默认 30M,0 = 当日不承接。
     // 字段总是写出(显式 0 与"未设置 30M"语义不同,不能稀疏省略)。
     std::int64_t daily_token_quota = kDefaultDailyQuotaTokens;
-    // 最后已知的当日已用 token 数与所属 UTC 日索引(本机上报,展示给其他
+    // 最后已知的当日已用 token 数与所属本机日索引(本机上报,展示给其他
     // 队员;离线设备显示这个快照)。quota_day 过期后展示按 0 处理。
     std::int64_t quota_used_today = 0;
     std::int64_t quota_day = 0;
@@ -85,9 +87,23 @@ inline bool is_admin(const TeamMember& member) {
     return member.role == kRoleAdmin;
 }
 
-// 团队内成员数上限校验(spec: 成员上限 50)。
+// 有效成员:退出墓碑(left_at != 0)不再计入成员列表、名额、角色和额度。
+inline bool member_active(const TeamMember& member) {
+    return member.left_at == 0;
+}
+
+// 活跃成员数(退出墓碑保留在数组里供同步与重新加入,但不占名额)。
+inline int active_member_count(const TeamMeta& meta) {
+    int count = 0;
+    for (const auto& member : meta.members) {
+        if (member_active(member)) ++count;
+    }
+    return count;
+}
+
+// 团队内成员数上限校验(spec: 成员上限 50;只统计活跃成员)。
 inline bool team_full(const TeamMeta& meta) {
-    return static_cast<int>(meta.members.size()) >= kMaxTeamMembers;
+    return active_member_count(meta) >= kMaxTeamMembers;
 }
 
 // 进行中的团队会话数(并发准入用;paused 仍占用槽位,ended 释放)。
@@ -101,6 +117,9 @@ inline int active_session_count(const TeamMeta& meta) {
 
 const TeamMember* find_member(const TeamMeta& meta, const std::string& guid);
 TeamMember* find_member(TeamMeta& meta, const std::string& guid);
+// 只查找有效成员(忽略退出墓碑)。
+const TeamMember* find_active_member(const TeamMeta& meta, const std::string& guid);
+TeamMember* find_active_member(TeamMeta& meta, const std::string& guid);
 const TeamSessionRef* find_session(const TeamMeta& meta, const std::string& session_id);
 TeamSessionRef* find_session(TeamMeta& meta, const std::string& session_id);
 

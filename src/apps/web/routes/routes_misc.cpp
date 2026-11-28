@@ -1851,17 +1851,35 @@ void WebServer::Impl::register_ui_preferences() {
             return with_cors(req, std::move(r));
         });
 
-        // GET /api/config/team:团队协作开关与本机账号每日 token 额度。
+        // GET /api/config/team:团队协作开关、本机账号每日 token 额度、
+        // 共享池当日已用(本机所有团队账本之和;模块关闭时为 0)与各团队明细。
         CROW_ROUTE(app, "/api/config/team").methods(crow::HTTPMethod::GET)
         ([this](const crow::request& req) {
             if (auto rej = require_auth(req)) return std::move(*rej);
             if (!deps.app_config) return crow::response(503);
+            // 先取共享池状态再持配置锁:team_account_quota_status 内部
+            // 也取 app_config_mu 共享锁,同线程嵌套取共享锁是未定义行为。
+            const auto account_status = team_service ? team_account_quota_status()
+                                                     : std::nullopt;
+            json account_quota_teams = json::array();
+            if (team_service) {
+                for (const auto& entry : team::account_quota_by_team(
+                         team_service->data_dir(),
+                         team_service->load_teams(/*include_archived=*/true),
+                         team_service->now() * 1000)) {
+                    account_quota_teams.push_back({{"team_id", entry.team_id},
+                                                   {"name", entry.name},
+                                                   {"used_today", entry.used}});
+                }
+            }
             std::shared_lock<std::shared_mutex> config_lock(app_config_mu);
             crow::response r(200);
             r.add_header("Content-Type", "application/json");
             r.body = json{
                 {"enabled", deps.app_config->team.enabled},
                 {"account_daily_token_quota", deps.app_config->team.account_daily_token_quota},
+                {"account_quota_used_today", account_status ? account_status->used : 0},
+                {"account_quota_teams", account_quota_teams},
             }.dump();
             return with_cors(req, std::move(r));
         });

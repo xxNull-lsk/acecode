@@ -41,6 +41,16 @@ TeamMember* find_member(TeamMeta& meta, const std::string& guid) {
     return it == meta.members.end() ? nullptr : &*it;
 }
 
+const TeamMember* find_active_member(const TeamMeta& meta, const std::string& guid) {
+    const TeamMember* member = find_member(meta, guid);
+    return member && member_active(*member) ? member : nullptr;
+}
+
+TeamMember* find_active_member(TeamMeta& meta, const std::string& guid) {
+    TeamMember* member = find_member(meta, guid);
+    return member && member_active(*member) ? member : nullptr;
+}
+
 const TeamSessionRef* find_session(const TeamMeta& meta, const std::string& session_id) {
     if (session_id.empty()) return nullptr;
     auto it = std::find_if(meta.sessions.begin(), meta.sessions.end(),
@@ -63,6 +73,8 @@ nlohmann::json member_to_json(const TeamMember& member) {
     set_opt_string(j, "role", member.role);
     set_opt_string(j, "address", member.address);
     set_opt_int(j, "last_seen", member.last_seen);
+    set_opt_int(j, "joined_at", member.joined_at);
+    set_opt_int(j, "left_at", member.left_at);
     set_opt_int(j, "updated_at", member.updated_at);
     set_opt_string(j, "updated_by", member.updated_by);
     // 额度字段:quota 总是写出(显式 0 有语义);用量快照非零才写。
@@ -80,6 +92,8 @@ TeamMember member_from_json(const nlohmann::json& j) {
     member.role = opt_string(j, "role");
     member.address = opt_string(j, "address");
     member.last_seen = opt_int(j, "last_seen");
+    member.joined_at = opt_int(j, "joined_at");
+    member.left_at = opt_int(j, "left_at");
     member.updated_at = opt_int(j, "updated_at");
     member.updated_by = opt_string(j, "updated_by");
     // 老版本成员记录没有该字段:按默认 30M 读回。

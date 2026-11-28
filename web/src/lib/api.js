@@ -387,6 +387,11 @@ export function createApi(base = null) {
       ...(options.repoUrl ? { repo_url: options.repoUrl } : {}),
     }, base),
     listTeams: () => request('GET', '/api/team', undefined, base),
+    listArchivedTeams: () => request('GET', '/api/team?archived=1', undefined, base),
+    leaveTeam: (teamId) =>
+      request('POST', `/api/team/${encodeURIComponent(teamId)}/leave`, {}, base, { timeoutMs: 120000 }),
+    deleteTeam: (teamId) =>
+      request('DELETE', `/api/team/${encodeURIComponent(teamId)}`, undefined, base, { timeoutMs: 120000 }),
     teamState: (teamId) => request('GET', `/api/team/${encodeURIComponent(teamId)}`, undefined, base),
     issueTeamInvite: (teamId, options = {}) =>
       request('POST', `/api/team/${encodeURIComponent(teamId)}/invite`, options, base),

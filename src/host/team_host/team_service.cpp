@@ -52,6 +52,11 @@ bool constant_time_equal(const std::string& a, const std::string& b) {
     return mismatch == 0;
 }
 
+// LWW 时间戳是秒级:同一秒内的退出/重新加入不能让墓碑被旧值盖回。
+std::int64_t next_updated_at(std::int64_t previous, std::int64_t now) {
+    return std::max(now, previous + 1);
+}
+
 } // namespace
 
 std::int64_t TeamService::default_clock() {
@@ -78,7 +83,7 @@ std::optional<TeamMeta> TeamService::load_team(const std::string& team_id) const
     return store_for(team_id).load_meta();
 }
 
-std::vector<TeamMeta> TeamService::load_teams() const {
+std::vector<TeamMeta> TeamService::load_teams(bool include_archived) const {
     std::vector<TeamMeta> teams;
     std::error_code ec;
     const fs::path root = teams_root(data_dir_);
@@ -86,14 +91,31 @@ std::vector<TeamMeta> TeamService::load_teams() const {
     for (const auto& entry : fs::directory_iterator(root, ec)) {
         if (ec) break;
         if (!entry.is_directory(ec)) continue;
-        auto meta = TeamStore(data_dir_, path_to_utf8(entry.path().filename())).load_meta();
-        if (meta && !meta->team_id.empty()) teams.push_back(std::move(*meta));
+        TeamStore store(data_dir_, path_to_utf8(entry.path().filename()));
+        auto meta = store.load_meta();
+        if (!meta || meta->team_id.empty()) continue;
+        if (!include_archived && store.load_local_state().archived_at != 0) continue;
+        teams.push_back(std::move(*meta));
     }
     std::sort(teams.begin(), teams.end(), [](const TeamMeta& a, const TeamMeta& b) {
         if (a.created_at != b.created_at) return a.created_at < b.created_at;
         return a.team_id < b.team_id;
     });
     return teams;
+}
+
+std::vector<TeamMeta> TeamService::load_archived_teams() const {
+    std::vector<TeamMeta> archived;
+    for (auto& meta : load_teams(/*include_archived=*/true)) {
+        if (store_for(meta.team_id).load_local_state().archived_at != 0)
+            archived.push_back(std::move(meta));
+    }
+    return archived;
+}
+
+bool TeamService::is_team_archived(const std::string& team_id) const {
+    if (team_id.empty()) return false;
+    return store_for(team_id).load_local_state().archived_at != 0;
 }
 
 std::optional<TeamMeta> TeamService::create_team(const std::string& name, std::string* error) {
@@ -117,6 +139,7 @@ std::optional<TeamMeta> TeamService::create_team(const std::string& name, std::s
     creator.display_name = self_.display_name;
     creator.role = std::string(kRoleAdmin);
     creator.last_seen = now;
+    creator.joined_at = now;
     creator.updated_at = now;
     creator.updated_by = self_.guid;
     meta.members.push_back(std::move(creator));
@@ -143,7 +166,7 @@ InviteIssueResult TeamService::issue_invite(const std::string& team_id,
         return result;
     }
     const TeamMember* self = find_member(*meta, self_.guid);
-    if (!self || !is_admin(*self)) {
+    if (!self || !member_active(*self) || !is_admin(*self)) {
         result.error = "not_admin";
         return result;
     }
@@ -192,7 +215,8 @@ TeamService::JoinAccept TeamService::accept_join(const std::string& team_id,
         accepted.error = "invalid_joiner";
         return accepted;
     }
-    if (find_member(*meta, joiner.guid)) {
+    TeamMember* existing = find_member(*meta, joiner.guid);
+    if (existing && member_active(*existing)) {
         accepted.error = "already_member";
         return accepted;
     }
@@ -205,16 +229,30 @@ TeamService::JoinAccept TeamService::accept_join(const std::string& team_id,
         accepted.error = "invite_invalid";
         return accepted;
     }
-    TeamMember member;
-    member.account = joiner.account;
-    member.guid = joiner.guid;
-    member.display_name = joiner.display_name;
-    member.role = std::string(kRoleMember);
-    member.last_seen = now;
-    member.updated_at = now;
-    member.updated_by = self_.guid;
-    meta->members.push_back(std::move(member));
-    meta->updated_at = now;
+    if (existing) {
+        // 退出后重新加入:复用墓碑,清掉退出时间;角色回退为普通成员。
+        existing->account = joiner.account;
+        existing->display_name = joiner.display_name;
+        existing->role = std::string(kRoleMember);
+        existing->last_seen = now;
+        existing->joined_at = now;
+        existing->left_at = 0;
+        existing->address.clear();
+        existing->updated_at = next_updated_at(existing->updated_at, now);
+        existing->updated_by = self_.guid;
+    } else {
+        TeamMember member;
+        member.account = joiner.account;
+        member.guid = joiner.guid;
+        member.display_name = joiner.display_name;
+        member.role = std::string(kRoleMember);
+        member.last_seen = now;
+        member.joined_at = now;
+        member.updated_at = now;
+        member.updated_by = self_.guid;
+        meta->members.push_back(std::move(member));
+    }
+    meta->updated_at = next_updated_at(meta->updated_at, now);
     meta->updated_by = self_.guid;
     if (!store.save_meta(*meta)) {
         accepted.error = "team_write_failed";
@@ -232,7 +270,7 @@ TeamOpResult TeamService::join_team(const TeamInviteLink& invite, const Snapshot
         return TeamOpResult::fail(fetch_error.empty() ? "snapshot_unavailable" : fetch_error);
     }
     if (snapshot->team_id != invite.team_id) return TeamOpResult::fail("team_id_mismatch");
-    if (!find_member(*snapshot, self_.guid)) return TeamOpResult::fail("self_not_in_team");
+    if (!find_active_member(*snapshot, self_.guid)) return TeamOpResult::fail("self_not_in_team");
     return apply_snapshot(*snapshot);
 }
 
@@ -240,6 +278,13 @@ TeamOpResult TeamService::apply_snapshot(const TeamMeta& snapshot) {
     if (snapshot.team_id.empty()) return TeamOpResult::fail("invalid_snapshot");
     if (!store_for(snapshot.team_id).save_meta(snapshot)) {
         return TeamOpResult::fail("team_write_failed");
+    }
+    // 重新加入(或加入)后团队不再是归档状态;保留本机工作目录,只清归档时间。
+    TeamStore store = store_for(snapshot.team_id);
+    TeamLocalState local = store.load_local_state();
+    if (local.archived_at != 0) {
+        local.archived_at = 0;
+        if (!store.save_local_state(local)) return TeamOpResult::fail("team_write_failed");
     }
     return TeamOpResult::success();
 }
@@ -333,9 +378,9 @@ TeamOpResult TeamService::set_role(const std::string& team_id, const std::string
     auto meta = load_team(team_id);
     if (!meta) return TeamOpResult::fail("team_not_found");
     const TeamMember* actor = find_member(*meta, actor_guid);
-    if (!actor || !is_admin(*actor)) return TeamOpResult::fail("not_admin");
+    if (!actor || !member_active(*actor) || !is_admin(*actor)) return TeamOpResult::fail("not_admin");
     TeamMember* target = find_member(*meta, target_guid);
-    if (!target) return TeamOpResult::fail("member_not_found");
+    if (!target || !member_active(*target)) return TeamOpResult::fail("member_not_found");
     if (target->role == role) return TeamOpResult::success();
 
     const std::int64_t now = now_seconds_();
@@ -354,7 +399,7 @@ TeamOpResult TeamService::touch_member(const std::string& team_id, const std::st
     auto meta = load_team(team_id);
     if (!meta) return TeamOpResult::fail("team_not_found");
     TeamMember* member = find_member(*meta, guid);
-    if (!member) return TeamOpResult::fail("member_not_found");
+    if (!member || !member_active(*member)) return TeamOpResult::fail("member_not_found");
     // 心跳不参与 LWW:只更新 last_seen/address,两侧合并时取 max。
     member->last_seen = now_seconds_();
     if (!address.empty()) member->address = address;
@@ -363,7 +408,7 @@ TeamOpResult TeamService::touch_member(const std::string& team_id, const std::st
 }
 
 bool TeamService::member_online(const TeamMeta& meta, const std::string& guid) const {
-    const TeamMember* member = find_member(meta, guid);
+    const TeamMember* member = find_active_member(meta, guid);
     if (!member) return false;
     return now_seconds_() - member->last_seen <= kMemberStaleSeconds;
 }
@@ -382,6 +427,10 @@ SessionRefResult TeamService::start_session(const std::string& team_id,
     auto meta = load_team(team_id);
     if (!meta) {
         result.error = "team_not_found";
+        return result;
+    }
+    if (!find_active_member(*meta, self_.guid)) {
+        result.error = "not_member";
         return result;
     }
     if (!team_matches_repo(*meta, repo)) {
@@ -424,6 +473,7 @@ TeamOpResult TeamService::register_repo(const std::string& team_id, const RepoId
     if (repo.kind.empty() || repo.value.empty()) return TeamOpResult::fail("invalid_repo");
     auto meta = load_team(team_id);
     if (!meta) return TeamOpResult::fail("team_not_found");
+    if (!find_active_member(*meta, self_.guid)) return TeamOpResult::fail("not_member");
     if (team_matches_repo(*meta, repo)) return TeamOpResult::success(); // 幂等
 
     const std::int64_t now = now_seconds_();
@@ -443,6 +493,7 @@ TeamOpResult TeamService::set_session_state(const std::string& team_id,
         return TeamOpResult::fail("invalid_state");
     auto meta = load_team(team_id);
     if (!meta) return TeamOpResult::fail("team_not_found");
+    if (!find_active_member(*meta, self_.guid)) return TeamOpResult::fail("not_member");
     TeamSessionRef* ref = find_session(*meta, session_id);
     if (!ref) return TeamOpResult::fail("session_not_found");
 
@@ -462,9 +513,10 @@ TeamOpResult TeamService::set_session_host(const std::string& team_id,
     if (new_host_guid.empty()) return TeamOpResult::fail("invalid_member");
     auto meta = load_team(team_id);
     if (!meta) return TeamOpResult::fail("team_not_found");
+    if (!find_active_member(*meta, self_.guid)) return TeamOpResult::fail("not_member");
     TeamSessionRef* ref = find_session(*meta, session_id);
     if (!ref) return TeamOpResult::fail("session_not_found");
-    if (!find_member(*meta, new_host_guid)) return TeamOpResult::fail("member_not_found");
+    if (!find_active_member(*meta, new_host_guid)) return TeamOpResult::fail("member_not_found");
     if (ref->host_guid == new_host_guid) return TeamOpResult::success();
 
     const std::int64_t now = now_seconds_();
@@ -483,7 +535,7 @@ TeamOpResult TeamService::set_daily_quota(const std::string& team_id,
     auto meta = load_team(team_id);
     if (!meta) return TeamOpResult::fail("team_not_found");
     TeamMember* member = find_member(*meta, actor_guid);
-    if (!member) return TeamOpResult::fail("member_not_found");
+    if (!member || !member_active(*member)) return TeamOpResult::fail("member_not_found");
     if (member->daily_token_quota == quota) return TeamOpResult::success();
 
     const std::int64_t now = now_seconds_();
@@ -502,7 +554,7 @@ TeamOpResult TeamService::report_quota_usage(const std::string& team_id, std::in
     auto meta = load_team(team_id);
     if (!meta) return TeamOpResult::fail("team_not_found");
     TeamMember* member = find_member(*meta, self_.guid);
-    if (!member) return TeamOpResult::fail("member_not_found");
+    if (!member || !member_active(*member)) return TeamOpResult::fail("member_not_found");
     if (member->quota_day == day && member->quota_used_today == used_today)
         return TeamOpResult::success();
 
@@ -573,20 +625,130 @@ std::vector<std::string> TeamService::mark_lost_host_sessions(const std::string&
         if (ref.state != kSessionStateRunning) continue;
         // 本机自己 host 的会话不判定失联(host 知道自己活着)。
         if (ref.host_guid == self_.guid) continue;
-        const TeamMember* host = find_member(*meta, ref.host_guid);
+        const TeamMember* host = find_active_member(*meta, ref.host_guid);
         if (host && now - host->last_seen <= kMemberStaleSeconds) continue;
         ref.state = std::string(kSessionStatePaused);
         ref.pause_reason = "失联";
-        ref.updated_at = now;
+        ref.updated_at = next_updated_at(ref.updated_at, now);
         marked.push_back(ref.session_id);
         changed = true;
     }
     if (changed) {
-        meta->updated_at = now;
+        meta->updated_at = next_updated_at(meta->updated_at, now);
         meta->updated_by = self_.guid;
         if (!store_for(team_id).save_meta(*meta)) return {};
     }
     return marked;
+}
+
+// 退出团队:本机状态机部分。网络推送由路由层负责,保证这里可单测。
+LeaveResult TeamService::leave_team(const std::string& team_id) {
+    LeaveResult result;
+    auto meta = load_team(team_id);
+    if (!meta) {
+        result.error = "team_not_found";
+        return result;
+    }
+    TeamMember* self = find_member(*meta, self_.guid);
+    if (!self) {
+        result.error = "not_member";
+        return result;
+    }
+    if (!member_active(*self)) {
+        // 幂等:上一次退出可能已写墓碑但归档失败,重试只需继续归档。
+        result.snapshot = *meta;
+        return result;
+    }
+
+    const std::int64_t now = now_seconds_();
+
+    // 1. 本机 host 的进行中会话先暂停:其他队员看到后可手动接管。
+    for (auto& ref : meta->sessions) {
+        if (ref.state != kSessionStateRunning || ref.host_guid != self_.guid) continue;
+        ref.state = std::string(kSessionStatePaused);
+        ref.pause_reason = "设备已退出";
+        ref.updated_at = next_updated_at(ref.updated_at, now);
+        result.paused_sessions.push_back(ref.session_id);
+    }
+
+    // 2. 最后管理员退出时,把最早加入的活跃成员提升为管理员。只在团队
+    //    将失去全部管理员时触发;还有其他管理员则保持原样。
+    if (is_admin(*self)) {
+        bool has_other_admin = false;
+        std::size_t replacement = meta->members.size();
+        for (std::size_t i = 0; i < meta->members.size(); ++i) {
+            const auto& member = meta->members[i];
+            if (member.guid == self_.guid || !member_active(member)) continue;
+            if (is_admin(member)) {
+                has_other_admin = true;
+                break;
+            }
+            if (replacement == meta->members.size()) {
+                replacement = i;
+                continue;
+            }
+            const auto& best = meta->members[replacement];
+            // joined_at == 0 是旧数据:视为比任何带时间的新成员更早加入。
+            if (best.joined_at > 0 &&
+                (member.joined_at == 0 || member.joined_at < best.joined_at)) {
+                replacement = i;
+            }
+        }
+        if (!has_other_admin && replacement < meta->members.size()) {
+            auto& promoted = meta->members[replacement];
+            promoted.role = std::string(kRoleAdmin);
+            promoted.updated_at = next_updated_at(promoted.updated_at, now);
+            promoted.updated_by = self_.guid;
+            result.promoted_guid = promoted.guid;
+        }
+    }
+
+    // 3. 本机成员写成墓碑。保留记录供同步与重新加入;不再计入名额与在线。
+    self->role = std::string(kRoleMember);
+    self->left_at = now;
+    self->address.clear();
+    self->updated_at = next_updated_at(self->updated_at, now);
+    self->updated_by = self_.guid;
+
+    meta->updated_at = next_updated_at(meta->updated_at, now);
+    meta->updated_by = self_.guid;
+    if (!store_for(team_id).save_meta(*meta)) {
+        result.error = "team_write_failed";
+        return result;
+    }
+    result.snapshot = std::move(*meta);
+    return result;
+}
+
+TeamOpResult TeamService::archive_team(const std::string& team_id) {
+    auto meta = load_team(team_id);
+    if (!meta) return TeamOpResult::fail("team_not_found");
+    TeamStore store = store_for(team_id);
+    TeamLocalState local = store.load_local_state();
+    if (local.archived_at == 0) {
+        local.archived_at = now_seconds_();
+        if (!store.save_local_state(local)) return TeamOpResult::fail("team_write_failed");
+    }
+    // 退出后本机不再持有团队凭据:清掉 invite_seed,避免归档快照还能访问
+    // 团队互访路由。重新加入时由邀请者快照恢复种子。
+    if (!meta->invite_seed.empty()) {
+        meta->invite_seed.clear();
+        if (!store.save_meta(*meta)) return TeamOpResult::fail("team_write_failed");
+    }
+    return TeamOpResult::success();
+}
+
+TeamOpResult TeamService::delete_archived_team(const std::string& team_id) {
+    if (team_id.empty()) return TeamOpResult::fail("invalid_team");
+    TeamStore store = store_for(team_id);
+    if (!store.load_meta()) return TeamOpResult::fail("team_not_found");
+    if (store.load_local_state().archived_at == 0)
+        return TeamOpResult::fail("team_not_archived");
+    std::error_code ec;
+    fs::remove_all(store.root_dir(), ec);
+    if (ec || fs::exists(store.root_dir(), ec))
+        return TeamOpResult::fail("team_delete_failed");
+    return TeamOpResult::success();
 }
 
 std::string derive_team_token(const std::string& invite_seed, const std::string& team_id) {

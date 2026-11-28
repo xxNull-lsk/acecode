@@ -54,7 +54,7 @@
 ### 各设备本地运行态（同目录）
 
 - `invite_ledger.json`：本机签发的一次性邀请码及消费状态
-- `quota_ledger`：本设备每日团队 token 消耗（复用 usage ledger 记录，UTC 日重置）
+- `quota_ledger`：本设备每日团队 token 消耗（复用 usage ledger 记录，按本机时间日重置）
 - `sessions/<session_id>/`：复制过来的团队会话数据（接管时落地）
 
 ## 核心机制

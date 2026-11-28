@@ -3,9 +3,11 @@
 #include "utils/utf8_path.hpp"
 
 #include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <sstream>
 
 namespace fs = std::filesystem;
@@ -34,6 +36,31 @@ std::string read_string(const nlohmann::json& j, const char* key) {
 }
 
 } // namespace
+
+// 本机时间日界:额度按设备本机时区的日历日(0 点)重置,不用 UTC 日。
+// 把本机墙上时间按 UTC 解释(timegm / _mkgmtime)得到其"墙上秒数",与真实
+// 时间戳之差即当前偏移,含夏令时;day = (now + offset) / 86'400'000 为本机
+// 日历日索引(UTC+8 的 22:00 属于本机次日,须加偏移才落到次日的日索引)。
+//
+// 不要用 mktime 归一 UTC 墙上时间:那会把 UTC 字段当作本地时间重新判定
+// DST,在切换窗口(如纽约回拨日 00:00-01:00)算出与真实偏移差 1 小时,
+// 把本机 0 点刚过的用量记到前一天。
+std::int64_t local_quota_day(std::int64_t now_ms) {
+    if (now_ms < 0) return 0;
+    const std::time_t seconds = static_cast<std::time_t>(now_ms / 1000);
+    std::tm local_tm{};
+#ifdef _WIN32
+    localtime_s(&local_tm, &seconds);
+    const std::time_t wall_seconds = _mkgmtime(&local_tm);
+#else
+    localtime_r(&seconds, &local_tm);
+    const std::time_t wall_seconds = timegm(&local_tm);
+#endif
+    const auto offset_ms =
+        (static_cast<std::int64_t>(wall_seconds) -
+         static_cast<std::int64_t>(seconds)) * 1000;
+    return (now_ms + offset_ms) / kQuotaDayMs;
+}
 
 QuotaLedger::QuotaLedger(std::string data_dir, std::string team_id)
     : data_dir_(std::move(data_dir)), team_id_(std::move(team_id)) {}
@@ -88,7 +115,7 @@ bool QuotaLedger::record(const acecode::SessionMeta& session, const acecode::Tok
     }
     QuotaLedgerRecord entry;
     entry.timestamp_ms = now_ms;
-    entry.day = now_ms / kQuotaDayMs;
+    entry.day = local_quota_day(now_ms);
     entry.session_id = session.id;
     entry.provider = session.provider;
     entry.model = session.model;
@@ -139,7 +166,11 @@ std::vector<QuotaLedgerRecord> QuotaLedger::load_all() const {
 std::int64_t QuotaLedger::used_for_day(std::int64_t day) const {
     std::int64_t total = 0;
     for (const auto& record : load_all()) {
-        if (record.day == day) total += record.usage.total_tokens;
+        // 以记录时间戳重算本机日,不信任落盘的 day 字段:旧版本用 UTC 日或
+        // 偏移方向错误的日索引写入,按 ts 重算可把存量记录自动归位。
+        if (local_quota_day(record.timestamp_ms) == day) {
+            total += record.usage.total_tokens;
+        }
     }
     return total;
 }
@@ -147,7 +178,7 @@ std::int64_t QuotaLedger::used_for_day(std::int64_t day) const {
 DeviceQuotaStatus local_quota_status(const TeamMeta& meta, const std::string& guid,
                                      const QuotaLedger& ledger, std::int64_t now_ms) {
     DeviceQuotaStatus status;
-    status.day = now_ms / kQuotaDayMs;
+    status.day = local_quota_day(now_ms);
     if (const TeamMember* member = find_member(meta, guid)) {
         status.quota = member->daily_token_quota;
     }
@@ -155,20 +186,31 @@ DeviceQuotaStatus local_quota_status(const TeamMeta& meta, const std::string& gu
     return status;
 }
 
+std::vector<TeamQuotaUsage> account_quota_by_team(const std::string& data_dir,
+                                                  const std::vector<TeamMeta>& teams,
+                                                  std::int64_t now_ms) {
+    const auto day = local_quota_day(now_ms);
+    std::vector<TeamQuotaUsage> result;
+    std::set<std::string> seen;
+    for (const auto& meta : teams) {
+        if (meta.team_id.empty() || !seen.insert(meta.team_id).second) continue;
+        result.push_back({meta.team_id, meta.name,
+                          QuotaLedger(data_dir, meta.team_id).used_for_day(day)});
+    }
+    return result;
+}
+
 DeviceQuotaStatus account_quota_status(std::int64_t account_quota,
                                        const std::string& data_dir,
                                        const std::vector<TeamMeta>& teams,
                                        std::int64_t now_ms) {
     DeviceQuotaStatus status;
-    status.day = now_ms / kQuotaDayMs;
+    status.day = local_quota_day(now_ms);
     status.quota = account_quota < 0 ? kDefaultDailyQuotaTokens : account_quota;
     // 共享池:本机账号下所有团队的账本当日用量求和(团队 ID 去重)。
     std::int64_t used = 0;
-    std::string last_team_id;
-    for (const auto& meta : teams) {
-        if (meta.team_id.empty() || meta.team_id == last_team_id) continue;
-        last_team_id = meta.team_id;
-        used += QuotaLedger(data_dir, meta.team_id).used_for_day(status.day);
+    for (const auto& entry : account_quota_by_team(data_dir, teams, now_ms)) {
+        used += entry.used;
     }
     status.used = used;
     return status;
@@ -177,7 +219,7 @@ DeviceQuotaStatus account_quota_status(std::int64_t account_quota,
 DeviceQuotaStatus member_quota_snapshot(const TeamMeta& meta, const std::string& guid,
                                         std::int64_t now_ms) {
     DeviceQuotaStatus status;
-    status.day = now_ms / kQuotaDayMs;
+    status.day = local_quota_day(now_ms);
     const TeamMember* member = find_member(meta, guid);
     if (!member) return status;
     status.quota = member->daily_token_quota;

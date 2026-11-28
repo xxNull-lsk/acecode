@@ -57,6 +57,6 @@ Windows 使用剪贴板变化通知，后台或托盘状态下先显示通知，
 
 在分享（第 1 级）与对端（第 2 级）之上，团队功能提供跨设备的多设备协作：任意成员可创建团队（`acecode://team/` 邀请码、15 分钟一次性），新加入者从邀请者拉全量团队状态；团队成员凭规范化 git remote URL（无 remote 用 `.git/acecode-repo-id` 兜底）关联到各自检出上的同一仓库。团队凭据 `X-ACECode-Team-Token` 由 invite_seed 派生，与分享凭据、daemon token 三者互不通用。
 
-团队会话与分享的差异在于写入权：分享永远是只读或独立提问；团队会话有唯一的 host 设备，队员消息经 WS 转发为 host 会话里的 human 消息并触发 AI 回合（host 生成期间排队不丢失）。host 是唯一写者，其他设备的查看是只读投影；手动切换（接管）时目标设备复制会话数据并 git 对齐到源 HEAD，绝不自动切换 host。每设备每日 token 贡献额度默认 30M、UTC 日重置、消耗记在 host 设备自己头上，与分享提问的共享者日额度（30 次/日）是两套独立口径。
+团队会话与分享的差异在于写入权：分享永远是只读或独立提问；团队会话有唯一的 host 设备，队员消息经 WS 转发为 host 会话里的 human 消息并触发 AI 回合（host 生成期间排队不丢失）。host 是唯一写者，其他设备的查看是只读投影；手动切换（接管）时目标设备复制会话数据并 git 对齐到源 HEAD，绝不自动切换 host。每设备每日 token 贡献额度默认 30M、按设备本机时间日重置、消耗记在 host 设备自己头上，与分享提问的共享者日额度（30 次/日）是两套独立口径。
 
 实现边界：团队不改变既有分享/对端行为；`domain/team`、`host/team_host` 与 Web 团队路由独立于 `domain/share`、`host/session_share`、`host/peers`。仅局域网/VPN 直连，无 NAT 穿透、中继与 TLS。接口见 [daemon API](daemon-api.md)「去中心化团队」一节，需求记录见 [团队功能方案](team/team-feature-plan.md)。

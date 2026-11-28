@@ -357,11 +357,13 @@ struct WebServer::Impl {
     void refresh_team_self_address(const std::string& team_id);
     // 本机对团队的可达地址(LAN 地址 + 代理监听端口)。
     std::string team_self_address();
-    // 队员消息投递:host 会话不在 registry(daemon 重启后)时先从磁盘恢复。
-    bool deliver_team_message(const std::string& session_id,
+    // 队员消息投递:host 会话不在 registry(daemon 重启后)时先从磁盘恢复,
+    // 恢复出的新 dispatcher 实例需要重挂团队订阅(用量记账依赖)。
+    bool deliver_team_message(const std::string& team_id, const std::string& session_id,
                               const team::TeamInboundMessage& message);
     // 取或建会话的队员消息中继。
-    std::shared_ptr<team::TeamMessageRelay> team_relay_for(const std::string& session_id);
+    std::shared_ptr<team::TeamMessageRelay> team_relay_for(const std::string& team_id,
+                                                           const std::string& session_id);
     // 向团队所有 WS 连接下发状态快照与会话事件(本机状态变更后调用)。
     void broadcast_team_state(const std::string& team_id);
     void broadcast_team_session_event(const std::string& team_id, std::string_view kind,
@@ -369,6 +371,10 @@ struct WebServer::Impl {
     void forward_team_session_event(const std::string& team_id, const std::string& session_id,
                                     const SessionEvent& event);
     void ensure_team_session_subscriptions(const std::string& team_id);
+    // 会话在本机 registry 重建(resume)后重挂团队订阅:旧订阅指向已销毁的
+    // dispatcher 实例,不重挂则用量记账与事件转发静默断链(共享池恒为 0)。
+    void refresh_team_session_subscription(const std::string& team_id,
+                                           const std::string& session_id);
     std::mutex sharing_mu;
     std::unordered_map<void*, std::shared_ptr<ShareConnection>> pending_sharing;
     std::unordered_map<crow::websocket::connection*, std::shared_ptr<ShareConnection>> sharing_connections;

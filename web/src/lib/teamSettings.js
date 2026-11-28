@@ -29,6 +29,13 @@ export function teamErrorText(e) {
       invalid_repo_url: '仓库 URL 无效:请填写可跨设备复用的远程仓库地址',
       workdir_not_git_repo: '工作目录不是 git 仓库,请填写远程仓库 URL',
       repo_mismatch: '工作目录与团队仓库不匹配:请检出团队仓库后重试',
+      already_archived: '团队已在归档中',
+      already_left: '你已退出该团队',
+      not_member: '你已不在该团队中',
+      team_not_archived: '只能删除已归档的团队,请先退出团队',
+      team_archive_failed: '归档团队失败,请重试',
+      session_delete_failed: '删除团队会话失败,请重试',
+      team_delete_failed: '删除团队失败,请重试',
     };
     return mapped[code] || e.message || '请求失败,请重试';
   }

@@ -1,6 +1,6 @@
 // 覆盖 src/host/team_host/quota_ledger.cpp 与 TeamService 的额度操作
 // (tasks 4.1-4.4)。锁定 spec(team-token-quota) 的四条契约:
-//   记账只认团队会话、UTC 日分桶跨日归零、用尽即暂停承接(含 0 额度)、
+//   记账只认团队会话、本机时间日分桶跨日归零、用尽即暂停承接(含 0 额度)、
 //   额度/用量展示取本机实测或最后已知快照。
 
 #include <gtest/gtest.h>
@@ -12,8 +12,10 @@
 #include "utils/utf8_path.hpp"
 
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <string>
 
 namespace fs = std::filesystem;
 using namespace acecode::team;
@@ -77,7 +79,7 @@ TeamMeta team_with_member(const std::string& guid = "guid-a") {
     return meta;
 }
 
-std::int64_t day_of(std::int64_t now_ms) { return now_ms / kQuotaDayMs; }
+std::int64_t day_of(std::int64_t now_ms) { return local_quota_day(now_ms); }
 
 } // namespace
 
@@ -106,10 +108,10 @@ TEST(QuotaLedger, RecordsOnlyTeamSessions) {
     EXPECT_EQ(ledger.used_today(1'700'000'000'000), 2'000'000);
 }
 
-// 4.1 场景: 按 UTC 日分桶,跨日归零;持久化可重读
+// 4.1 场景: 按本机时间日分桶,跨日归零;持久化可重读
 TEST(QuotaLedger, DayBucketsResetAndPersist) {
     TempDir temp;
-    const std::int64_t day1_ms = 1'700'000'000'000; // UTC day N
+    const std::int64_t day1_ms = 1'700'000'000'000; // 本机日 N
     {
         QuotaLedger ledger(temp.utf8(), "team-1");
         std::string error;
@@ -141,6 +143,7 @@ TEST(QuotaLedger, ToleratesCorruptLines) {
     {
         std::ofstream out(path, std::ios::binary);
         out << "{not json}\n";
+        // ts=1ms,day 字段写一个不匹配的值:读取按 ts 重算本机日,day 仅参考。
         out << quota_ledger_record_to_json(QuotaLedgerRecord{1, 2, "s-1", "", "", usage(500)}).dump()
             << "\n";
     }
@@ -148,8 +151,69 @@ TEST(QuotaLedger, ToleratesCorruptLines) {
     const auto records = ledger.load_all();
     ASSERT_EQ(records.size(), 1u);
     EXPECT_EQ(records[0].usage.total_tokens, 500);
-    EXPECT_EQ(ledger.used_for_day(2), 500);
+    EXPECT_EQ(ledger.used_for_day(local_quota_day(1)), 500);
+    // 存量记录的 day 字段错误(如旧版 UTC 日)不影响当日累计
+    EXPECT_EQ(ledger.used_for_day(2), 0);
 }
+
+// 本机时间日界:UTC+8 的 22:00 属于本机次日;重置点为本机 0 点而非 UTC 0 点。
+TEST(QuotaLedger, LocalDayFollowsMachineTimezone) {
+#ifdef _WIN32
+    char prev_tz[128] = {};
+    size_t prev_size = 0;
+    getenv_s(&prev_size, prev_tz, sizeof(prev_tz), "TZ");
+    // MSVC 的 TZ 只认 POSIX 写法(CST-8 = UTC+8),不认 IANA 名。
+    _putenv_s("TZ", "CST-8");
+    _tzset();
+#else
+    const char* prev = getenv("TZ");
+    const std::string prev_tz = prev ? prev : "";
+    setenv("TZ", "Asia/Shanghai", 1);
+    tzset();
+#endif
+    // UTC 2023-11-14 22:13:20 = 本机(UTC+8) 2023-11-15 06:13:20 → 本机日索引 = UTC 日 + 1
+    const std::int64_t cst_morning = 1'700'000'000'000;
+    EXPECT_EQ(local_quota_day(cst_morning), cst_morning / kQuotaDayMs + 1);
+    // UTC 2023-11-14 15:58:00 = 本机 23:58(还是 11-14) → 与 UTC 日索引相同
+    const std::int64_t cst_late_evening = 1'699'977'480'000;
+    EXPECT_EQ(local_quota_day(cst_late_evening), cst_late_evening / kQuotaDayMs);
+    // UTC 2023-11-14 20:00:00 = 本机 2023-11-15 04:00 → 本机日索引 = UTC 日 + 1
+    const std::int64_t cst_dawn = 1'699'992'000'000;
+    EXPECT_EQ(local_quota_day(cst_dawn), cst_dawn / kQuotaDayMs + 1);
+#ifdef _WIN32
+    _putenv_s("TZ", prev_tz && prev_tz[0] ? prev_tz : "");
+    _tzset();
+#else
+    if (!prev_tz.empty()) setenv("TZ", prev_tz.c_str(), 1);
+    else unsetenv("TZ");
+    tzset();
+#endif
+}
+
+// 夏令时回拨日的 0 点:本机 00:30 EDT 仍属于当天。旧实现用 mktime 把 UTC
+// 墙上时间按本地时间归一,切换窗口内偏移差 1 小时,会把这半小时记到前一天。
+#ifndef _WIN32
+TEST(QuotaLedger, LocalDaySurvivesDstFallBack) {
+    const char* prev = getenv("TZ");
+    const std::string prev_tz = prev ? prev : "";
+    setenv("TZ", "America/New_York", 1);
+    tzset();
+    // 2023-11-05T04:30Z = 本机 2023-11-05 00:30 EDT(UTC-4),UTC 与本机同日
+    const std::int64_t just_after_midnight = 1'699'158'600'000;
+    EXPECT_EQ(local_quota_day(just_after_midnight), just_after_midnight / kQuotaDayMs);
+    // 2023-11-05T05:30Z / 06:30Z = 回拨前后两个 01:30,仍属当天
+    const std::int64_t first_one_thirty = 1'699'162'200'000;
+    const std::int64_t second_one_thirty = 1'699'165'800'000;
+    EXPECT_EQ(local_quota_day(first_one_thirty), first_one_thirty / kQuotaDayMs);
+    EXPECT_EQ(local_quota_day(second_one_thirty), second_one_thirty / kQuotaDayMs);
+    // 2023-11-05T03:30Z = 本机 2023-11-04 23:30 EDT,本机日索引比 UTC 小 1
+    const std::int64_t previous_evening = 1'699'155'000'000;
+    EXPECT_EQ(local_quota_day(previous_evening), previous_evening / kQuotaDayMs - 1);
+    if (!prev_tz.empty()) setenv("TZ", prev_tz.c_str(), 1);
+    else unsetenv("TZ");
+    tzset();
+}
+#endif
 
 // 4.2 场景: 默认额度 30M;成员可自行修改(含 0);只能改自己的
 TEST(QuotaService, DailyQuotaDefaultsAndSelfService) {
@@ -239,12 +303,22 @@ TEST(QuotaService, AccountPoolSumsAcrossTeams) {
 
     TeamMeta team1 = team_with_member();
     team1.team_id = "team-1";
+    team1.name = "研发组";
     TeamMeta team2 = team_with_member();
     team2.team_id = "team-2";
 
     const auto status = account_quota_status(30'000'000, temp.utf8(), {team1, team2}, now_ms);
     EXPECT_EQ(status.used, 25'000'000); // 两团队之和 = 共享池已用
     EXPECT_FALSE(status.exhausted());
+
+    // 团队明细:与总和同口径,各团队各自账本当日之和;重复团队 ID 去重
+    const auto breakdown = account_quota_by_team(temp.utf8(), {team1, team2, team1}, now_ms);
+    ASSERT_EQ(breakdown.size(), 2u);
+    EXPECT_EQ(breakdown[0].team_id, "team-1");
+    EXPECT_EQ(breakdown[0].name, "研发组");
+    EXPECT_EQ(breakdown[0].used, 10'000'000);
+    EXPECT_EQ(breakdown[1].team_id, "team-2");
+    EXPECT_EQ(breakdown[1].used, 15'000'000);
 
     // 超过账号额度即用尽(单团队未超也会被共享池拦住)
     EXPECT_TRUE(account_quota_status(20'000'000, temp.utf8(), {team1, team2}, now_ms)
@@ -289,7 +363,7 @@ TEST(QuotaService, ExhaustionPausesSelfHostedSessions) {
     EXPECT_TRUE(service.pause_sessions_for_quota("team-1").empty());
 }
 
-// 4.3 场景: UTC 日切换后本机 host 的配额暂停恢复 running;其他暂停原因不动
+// 4.3 场景: 本机时间日切换后本机 host 的配额暂停恢复 running;其他暂停原因不动
 TEST(QuotaService, QuotaPauseResumesNextDay) {
     TempDir temp;
     Clock clock;
@@ -302,7 +376,7 @@ TEST(QuotaService, QuotaPauseResumesNextDay) {
     meta.sessions.push_back({"s-2", "失联暂停", "guid-a", "paused", "失联", "guid-a", 1, 1});
     ASSERT_TRUE(TeamStore(temp.utf8(), "team-1").save_meta(meta));
 
-    clock.now += 90'000; // UTC 日切换由账本/调用方判定,这里只验证恢复逻辑
+    clock.now += 90'000; // 日切换由账本/调用方判定,这里只验证恢复逻辑
     const auto resumed = service.resume_quota_paused_sessions("team-1");
     ASSERT_EQ(resumed.size(), 1u);
     EXPECT_EQ(resumed[0], "s-1");

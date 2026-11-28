@@ -1311,6 +1311,9 @@ void WebServer::Impl::register_sessions() {
             }
             // SessionRegistry 在内部短持共享锁复制 config+revision，随后释放
             // 再解析 jsonl/构造 Provider；路由不可在外层重复获取同一 shared_mutex。
+            const auto entry_before_resume = deps.session_registry
+                ? deps.session_registry->acquire(id)
+                : nullptr;
             bool resumed = false;
             try {
                 resumed = deps.session_client->resume_session(id, opts);
@@ -1335,6 +1338,15 @@ void WebServer::Impl::register_sessions() {
             auto resumed_entry = deps.session_registry
                 ? deps.session_registry->acquire(id)
                 : nullptr;
+            // 团队会话经 resume 重建后重挂订阅(见 routes_workspaces 同注);
+            // 已激活会话走快速路径时 dispatcher 未变,只补缺失订阅。
+            if (!meta.team_id.empty()) {
+                if (entry_before_resume && resumed_entry == entry_before_resume) {
+                    ensure_team_session_subscriptions(meta.team_id);
+                } else {
+                    refresh_team_session_subscription(meta.team_id, id);
+                }
+            }
             const WorktreeSessionInfo worktree = resumed_entry && resumed_entry->sm
                 ? resumed_entry->sm->active_worktree()
                 : WorktreeSessionInfo{};

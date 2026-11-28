@@ -84,6 +84,7 @@ bool TeamStore::save_local_state(const TeamLocalState& state) const {
     if (ec) return false;
     json j;
     if (!state.work_dir.empty()) j["work_dir"] = state.work_dir;
+    if (state.archived_at != 0) j["archived_at"] = state.archived_at;
     return atomic_write_file(path_to_utf8(local_path_), j.dump());
 }
 
@@ -103,6 +104,10 @@ TeamLocalState TeamStore::load_local_state() const {
     const auto work_dir = parsed.find("work_dir");
     if (work_dir != parsed.end() && work_dir->is_string())
         state.work_dir = work_dir->get<std::string>();
+    if (const auto archived_at = parsed.find("archived_at");
+        archived_at != parsed.end() && archived_at->is_number_integer()) {
+        state.archived_at = archived_at->get<std::int64_t>();
+    }
     return state;
 }
 

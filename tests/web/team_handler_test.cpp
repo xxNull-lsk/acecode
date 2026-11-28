@@ -41,7 +41,7 @@ TeamMeta sample_team() {
     b.last_seen = 1'700'000'000 - 10;
     b.daily_token_quota = 10'000'000;
     b.quota_used_today = 4'000'000;
-    b.quota_day = 1'700'000'000'000 / kQuotaDayMs; // 今天
+    b.quota_day = local_quota_day(1'700'000'000'000); // 今天
     b.updated_at = 100;
     meta.members.push_back(b);
     meta.sessions.push_back({"s-1", "调试登录", "guid-a", "running", "", "guid-a", 1, 2});
@@ -187,4 +187,34 @@ TEST(TeamHandler, MultipleSubscribersSeeSameOrder) {
     EXPECT_EQ(seqs[0], seqs[1]);
     for (std::size_t i = 0; i < seqs[0].size(); ++i)
         EXPECT_EQ(seqs[0][i], i + 1);
+}
+
+// 场景: 已退出成员不出现在有效成员列表;归档时间随本机状态投影
+TEST(TeamHandler, TombstonesAreFilteredAndArchiveTimeIsLocal) {
+    TeamMeta meta = sample_team();
+    TeamMember* b = find_member(meta, "guid-b");
+    ASSERT_TRUE(b);
+    b->left_at = 1'700'000'010;
+    b->updated_at = 1'700'000'010;
+
+    TeamLocalState local;
+    local.work_dir = "/home/a/demo";
+    local.archived_at = 1'700'000'020;
+    QuotaLedger ledger("/nonexistent-quota-dir", "team-1");
+    const auto j = team_state_json(meta, "guid-a", ledger, 1'700'000'000, local);
+    ASSERT_EQ(j["members"].size(), 1u);
+    EXPECT_EQ(j["members"][0]["guid"], "guid-a");
+    EXPECT_EQ(j["local"]["archived_at"], 1'700'000'020);
+    EXPECT_EQ(j["local"]["work_dir"], "/home/a/demo");
+}
+
+// 场景: 没有本机状态时不出现 local 字段;归档时间单独存在时仍投影
+TEST(TeamHandler, ArchiveTimeWithoutWorkdirIsProjected) {
+    TeamMeta meta = sample_team();
+    TeamLocalState local;
+    local.archived_at = 1'700'000'030;
+    QuotaLedger ledger("/nonexistent-quota-dir", "team-1");
+    const auto j = team_state_json(meta, "guid-a", ledger, 1'700'000'000, local);
+    EXPECT_EQ(j["local"]["archived_at"], 1'700'000'030);
+    EXPECT_FALSE(j["local"].contains("work_dir"));
 }

@@ -109,6 +109,7 @@
 #include <filesystem>
 #include <functional>
 #include <fstream>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <random>
@@ -1500,6 +1501,196 @@ TEST(WebServerHttp, DesktopNotificationSettingRejectsInvalidPayload) {
     ASSERT_EQ(put.status_code, 400) << put.text;
     EXPECT_EQ(json::parse(put.text)["error"], "BAD_REQUEST");
     EXPECT_TRUE(fx.cfg.desktop.notifications.enabled);
+}
+
+// GET /api/config/team 透出账号级共享池当日已用与各团队明细(本机所有团队
+// 账本之和)。用量经会话 Usage 事件入账,这里直接种账本文件,验证配置端点
+// 的汇总与暴露。
+TEST(WebServerHttp, TeamConfigExposesAccountPoolUsedToday) {
+    WebServerFixture fx;
+    auto enable = cpr::Put(
+        cpr::Url{fx.url("/api/config/team")},
+        cpr::Header{{"Content-Type", "application/json"}},
+        cpr::Body{R"({"enabled":true})"});
+    ASSERT_EQ(enable.status_code, 200) << enable.text;
+
+    auto create_team = [&](const std::string& name) {
+        auto created = cpr::Post(
+            cpr::Url{fx.url("/api/team")},
+            cpr::Header{{"Content-Type", "application/json"}},
+            cpr::Body{json{{"name", name}, {"cwd", fx.cwd},
+                           {"repo_url", "https://github.com/Org/Repo"}}.dump()});
+        EXPECT_EQ(created.status_code, 200) << created.text;
+        return created;
+    };
+    const auto team_a = create_team("研发组");
+    const auto team_b = create_team("测试组");
+    const auto team_id_a = json::parse(team_a.text).value("team_id", std::string{});
+    const auto team_id_b = json::parse(team_b.text).value("team_id", std::string{});
+    ASSERT_FALSE(team_id_a.empty());
+    ASSERT_FALSE(team_id_b.empty());
+
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto seed_ledger = [&](const std::string& team_id, std::int64_t total) {
+        const auto ledger_path = fx.tmp_dir / "team" / team_id / "quota_ledger.jsonl";
+        std::filesystem::create_directories(ledger_path.parent_path());
+        std::ofstream out(ledger_path, std::ios::binary);
+        // day 字段故意写 0(旧版口径):读取按 ts 重算本机日,不应影响汇总。
+        out << json{{"v", 1},
+                    {"ts_ms", now_ms},
+                    {"day", 0},
+                    {"session_id", "s-1"},
+                    {"usage", {{"total_tokens", total}, {"has_data", true}}}}
+                    .dump()
+            << "\n";
+    };
+    seed_ledger(team_id_a, 2'500'000);
+    seed_ledger(team_id_b, 1'000'000);
+
+    auto config = cpr::Get(cpr::Url{fx.url("/api/config/team")});
+    ASSERT_EQ(config.status_code, 200) << config.text;
+    const auto body = json::parse(config.text);
+    EXPECT_EQ(body["enabled"], true);
+    EXPECT_EQ(body["account_quota_used_today"], 3'500'000);
+    const auto& teams = body["account_quota_teams"];
+    ASSERT_TRUE(teams.is_array());
+    ASSERT_EQ(teams.size(), 2u);
+    std::map<std::string, json> by_id;
+    for (const auto& t : teams) by_id[t.value("team_id", "")] = t;
+    EXPECT_EQ(by_id.at(team_id_a).value("name", ""), "研发组");
+    EXPECT_EQ(by_id.at(team_id_a).value("used_today", std::int64_t{0}), 2'500'000);
+    EXPECT_EQ(by_id.at(team_id_b).value("name", ""), "测试组");
+    EXPECT_EQ(by_id.at(team_id_b).value("used_today", std::int64_t{0}), 1'000'000);
+}
+
+// 团队 host 会话跑一回合(provider 上报 usage)后,Usage 事件必须入账:
+// 共享池当日已用与该团队明细为非零。订阅断链(resume 后指向旧 dispatcher)
+// 时这里恒为 0,是对线上"共享池当日消耗始终为 0"的回归覆盖。
+namespace {
+
+// 给团队用例建团队 + 团队会话;返回 {team_id, session_id}。cwd 必须已是
+// git 仓库(发起会话按仓库身份准入)。
+std::pair<std::string, std::string> start_team_session_for_test(
+    WebServerFixture& fx, const std::string& team_name) {
+    auto created = cpr::Post(
+        cpr::Url{fx.url("/api/team")},
+        cpr::Header{{"Content-Type", "application/json"}},
+        cpr::Body{json{{"name", team_name}, {"cwd", fx.cwd}}.dump()});
+    EXPECT_EQ(created.status_code, 200) << created.text;
+    const auto team_id = json::parse(created.text).value("team_id", std::string{});
+    EXPECT_FALSE(team_id.empty());
+    auto start = cpr::Post(
+        cpr::Url{fx.url("/api/team/" + team_id + "/session")},
+        cpr::Header{{"Content-Type", "application/json"}},
+        cpr::Body{R"({})"});
+    EXPECT_EQ(start.status_code, 200) << start.text;
+    return {team_id, json::parse(start.text).value("session_id", std::string{})};
+}
+
+acecode_test::ScriptedResponse usage_turn_script(int total_tokens) {
+    acecode_test::ScriptedResponse scripted;
+    acecode::StreamEvent delta;
+    delta.type = acecode::StreamEventType::Delta;
+    delta.content = "ok";
+    acecode::StreamEvent usage_event;
+    usage_event.type = acecode::StreamEventType::Usage;
+    usage_event.usage.prompt_tokens = total_tokens - 100;
+    usage_event.usage.completion_tokens = 100;
+    usage_event.usage.total_tokens = total_tokens;
+    usage_event.usage.has_data = true;
+    acecode::StreamEvent done;
+    done.type = acecode::StreamEventType::Done;
+    done.finish_reason = "stop";
+    scripted.events = {delta, usage_event, done};
+    return scripted;
+}
+
+// 跑完一回合(provider 上报 usage)并等 turn 结束。
+void run_one_usage_turn(WebServerFixture& fx, const std::string& session_id, int total_tokens) {
+    auto entry = fx.registry->acquire(session_id);
+    ASSERT_TRUE(entry) << session_id;
+    auto provider = std::make_shared<acecode_test::StubLlmProvider>();
+    provider->push_response(usage_turn_script(total_tokens));
+    install_test_provider(*entry, provider);
+    entry->loop->submit("统计一下这回合的用量");
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (entry->loop->has_pending_work() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(5ms);
+    }
+    ASSERT_FALSE(entry->loop->has_pending_work());
+    EXPECT_EQ(provider->turn_count(), 1);
+}
+
+void expect_pool_used(WebServerFixture& fx, const std::string& team_id, std::int64_t used) {
+    auto config = cpr::Get(cpr::Url{fx.url("/api/config/team")});
+    ASSERT_EQ(config.status_code, 200) << config.text;
+    const auto body = json::parse(config.text);
+    EXPECT_EQ(body["account_quota_used_today"].get<std::int64_t>(), used);
+    bool found = false;
+    for (const auto& t : body["account_quota_teams"]) {
+        if (t.value("team_id", "") == team_id) {
+            found = true;
+            EXPECT_EQ(t.value("used_today", std::int64_t{0}), used);
+        }
+    }
+    EXPECT_TRUE(found) << body.dump();
+}
+
+} // namespace
+
+TEST(WebServerHttp, TeamHostSessionUsageAccountedInSharedPool) {
+    if (!acecode::worktree::run_git({"--version"}, "").ok()) {
+        GTEST_SKIP() << "git unavailable";
+    }
+    WebServerFixture fx;
+    ASSERT_TRUE(acecode::worktree::run_git({"init", "-b", "main"}, fx.cwd).ok());
+
+    auto enable = cpr::Put(
+        cpr::Url{fx.url("/api/config/team")},
+        cpr::Header{{"Content-Type", "application/json"}},
+        cpr::Body{R"({"enabled":true})"});
+    ASSERT_EQ(enable.status_code, 200) << enable.text;
+
+    const auto [team_id, session_id] = start_team_session_for_test(fx, "入账组");
+    ASSERT_FALSE(session_id.empty());
+
+    run_one_usage_turn(fx, session_id, 1'500);
+    expect_pool_used(fx, team_id, 1'500);
+}
+
+// 会话重建后再次打开的真实路径:registry 里已没有该会话,侧栏按工作区
+// resume 打开,再跑回合仍要入账(resume 重建 dispatcher 后必须重挂团队
+// 订阅)。daemon 重启后第一次打开会话也走这条 resume 路径。
+TEST(WebServerHttp, TeamHostSessionUsageAccountedAfterResume) {
+    if (!acecode::worktree::run_git({"--version"}, "").ok()) {
+        GTEST_SKIP() << "git unavailable";
+    }
+    WebServerFixture fx;
+    ASSERT_TRUE(acecode::worktree::run_git({"init", "-b", "main"}, fx.cwd).ok());
+
+    auto enable = cpr::Put(
+        cpr::Url{fx.url("/api/config/team")},
+        cpr::Header{{"Content-Type", "application/json"}},
+        cpr::Body{R"({"enabled":true})"});
+    ASSERT_EQ(enable.status_code, 200) << enable.text;
+
+    const auto [team_id, session_id] = start_team_session_for_test(fx, "续跑组");
+    ASSERT_FALSE(session_id.empty());
+
+    // 销毁 registry 里的会话(团队订阅表仍留旧 id),磁盘数据保留;
+    // 随后按工作区 resume,必须换成指向新 dispatcher 的订阅。
+    fx.client->destroy_session(session_id);
+
+    const std::string hash = acecode::compute_cwd_hash(fx.cwd);
+    auto resumed = cpr::Post(
+        cpr::Url{fx.url("/api/workspaces/" + hash + "/sessions/" + session_id + "/resume")},
+        cpr::Header{{"Content-Type", "application/json"}},
+        cpr::Body{R"({})"});
+    ASSERT_EQ(resumed.status_code, 200) << resumed.text;
+
+    run_one_usage_turn(fx, session_id, 2'000);
+    expect_pool_used(fx, team_id, 2'000);
 }
 
 TEST(WebServerHttp, RemoteWebModeControlsProxyAndKeepsDaemonListenerAlive) {

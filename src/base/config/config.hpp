@@ -658,7 +658,7 @@ struct TeamConfig {
     // 栏目;已创建/已加入的团队数据保留,重新开启后原样恢复。
     bool enabled = false;
     // 本机登录账号的每日 token 额度:额度属于登录账号而非设备,账号下的所有
-    // 团队共享同一个池(UTC 日重置)。0 = 当日不承接任何团队会话。
+    // 团队共享同一个池(按设备本机时间日重置)。0 = 当日不承接任何团队会话。
     std::int64_t account_daily_token_quota = 30'000'000;
 };
 // 解析与稀疏保存(team_config.cpp,与 swarm/image_generation 同一模式)。

@@ -26,6 +26,7 @@ TEST(TeamMeta, RoundTripPreservesAllFields) {
     admin.role = "admin";
     admin.address = "192.168.1.10:12399";
     admin.last_seen = 1500;
+    admin.joined_at = 1100;
     admin.updated_at = 1200;
     admin.updated_by = "guid-a";
     meta.members.push_back(admin);
@@ -69,6 +70,7 @@ TEST(TeamMeta, RoundTripPreservesAllFields) {
     EXPECT_EQ(decoded.members[0].role, "admin");
     EXPECT_EQ(decoded.members[0].address, "192.168.1.10:12399");
     EXPECT_EQ(decoded.members[0].last_seen, 1500);
+    EXPECT_EQ(decoded.members[0].joined_at, 1100);
     EXPECT_EQ(decoded.members[0].updated_at, 1200);
     EXPECT_EQ(decoded.members[0].updated_by, "guid-a");
     EXPECT_EQ(decoded.members[1].guid, "guid-b");
@@ -105,6 +107,33 @@ TEST(TeamMeta, MissingFieldsReadAsDefaults) {
     const TeamMember bad = member_from_json(nlohmann::json{{"guid", 42}, {"last_seen", "no"}});
     EXPECT_TRUE(bad.guid.empty());
     EXPECT_EQ(bad.last_seen, 0);
+}
+
+// 场景: 退出墓碑/加入时间往返,且墓碑不占成员名额
+TEST(TeamMeta, LeftMemberTombstoneRoundTripAndQuota) {
+    TeamMember left;
+    left.guid = "guid-a";
+    left.joined_at = 10;
+    left.left_at = 20;
+    const TeamMember decoded = member_from_json(member_to_json(left));
+    EXPECT_EQ(decoded.joined_at, 10);
+    EXPECT_EQ(decoded.left_at, 20);
+    EXPECT_FALSE(member_active(decoded));
+    EXPECT_TRUE(member_active(TeamMember{}));
+
+    TeamMeta meta;
+    for (int i = 0; i < kMaxTeamMembers; ++i) {
+        TeamMember member;
+        member.guid = "guid-" + std::to_string(i);
+        meta.members.push_back(member);
+    }
+    EXPECT_TRUE(team_full(meta));
+    EXPECT_EQ(active_member_count(meta), kMaxTeamMembers);
+    meta.members[0].left_at = 30;
+    EXPECT_FALSE(team_full(meta));
+    EXPECT_EQ(active_member_count(meta), kMaxTeamMembers - 1);
+    EXPECT_EQ(find_active_member(meta, "guid-0"), nullptr);
+    EXPECT_EQ(find_member(meta, "guid-0"), &meta.members[0]);
 }
 
 // 场景: 空字符串与零时间戳字段不写出,保持稀疏

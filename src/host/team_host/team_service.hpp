@@ -54,6 +54,15 @@ struct SessionRefResult {
     explicit operator bool() const { return error.empty(); }
 };
 
+// 退出结果:带墓碑/暂停/管理员转让的本地快照,供调用方尽力推送给在线队员。
+struct LeaveResult {
+    TeamMeta snapshot;
+    std::vector<std::string> paused_sessions;
+    std::string promoted_guid;
+    std::string error;
+    explicit operator bool() const { return error.empty(); }
+};
+
 // 加入时从邀请者拉全量快照;网络实现由调用方注入(fetcher 抛错/返回空都按
 // 失败处理)。测试用假 fetcher 覆盖加入流程的状态迁移。
 using SnapshotFetcher = std::function<std::optional<TeamMeta>(const TeamInviteLink& invite,
@@ -72,8 +81,22 @@ public:
     TeamStore store_for(const std::string& team_id) const;
 
     // 本机所有团队(扫描 data_dir/team/*/team.json),按创建时间升序。
-    std::vector<TeamMeta> load_teams() const;
+    // 默认只返回活跃团队;include_archived=true 时包含已退出归档的团队。
+    std::vector<TeamMeta> load_teams(bool include_archived = false) const;
+    std::vector<TeamMeta> load_archived_teams() const;
     std::optional<TeamMeta> load_team(const std::string& team_id) const;
+    bool is_team_archived(const std::string& team_id) const;
+
+    // 退出团队:暂停本机 host 的进行中会话、必要时转让管理员、写本机成员墓碑。
+    // 只改本机快照;调用方负责推送与归档本机会话。
+    LeaveResult leave_team(const std::string& team_id);
+
+    // 归档本机团队(退出完成后的最后一步):记录 archived_at 并清掉本机
+    // invite_seed,不再持有团队凭据。只影响本机。
+    TeamOpResult archive_team(const std::string& team_id);
+
+    // 永久删除本机归档团队目录;活跃团队必须先退出(拒绝删除)。
+    TeamOpResult delete_archived_team(const std::string& team_id);
 
     // 创建团队:创建者为管理员;生成团队 ID 与邀请种子并落盘。
     std::optional<TeamMeta> create_team(const std::string& name, std::string* error);
@@ -141,7 +164,7 @@ public:
     // 本机额度用尽:把本机 host 的进行中团队会话置 paused(额度已用尽)。
     // 返回被暂停的会话 ID(调用方广播通知);数据不清除。
     std::vector<std::string> pause_sessions_for_quota(const std::string& team_id);
-    // UTC 日切换后额度归零:把本机 host 的 paused(额度已用尽) 会话恢复 running。
+    // 本机时间日切换后额度归零:把本机 host 的 paused(额度已用尽) 会话恢复 running。
     // 仅恢复配额原因的暂停,不动失联/异常等其他原因。
     std::vector<std::string> resume_quota_paused_sessions(const std::string& team_id);
 

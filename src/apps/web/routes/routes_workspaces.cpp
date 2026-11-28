@@ -1025,6 +1025,17 @@ void WebServer::Impl::register_workspaces() {
             auto resumed_entry = deps.session_registry
                 ? deps.session_registry->acquire(id)
                 : nullptr;
+            // 团队会话经 resume 重建后重挂订阅:旧 dispatcher 上的订阅已死,
+            // 不重挂则本机 host 的用量不再入账(共享池当日已用停更)。已激活
+            // 的会话走 resume 快速路径,dispatcher 未变,只补缺失订阅,避免
+            // 拆掉有效订阅时漏掉在途事件。
+            if (!meta.team_id.empty()) {
+                if (active_entry && resumed_entry == active_entry) {
+                    ensure_team_session_subscriptions(meta.team_id);
+                } else {
+                    refresh_team_session_subscription(meta.team_id, id);
+                }
+            }
             const WorktreeSessionInfo worktree = resumed_entry && resumed_entry->sm
                 ? resumed_entry->sm->active_worktree()
                 : WorktreeSessionInfo{};
